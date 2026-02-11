@@ -1,0 +1,537 @@
+﻿<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Animazione da Immagine + Prompt</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --muted: #94a3b8;
+      --text: #e2e8f0;
+      --accent: #22c55e;
+      --accent-2: #38bdf8;
+      --border: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: radial-gradient(1200px 600px at 20% 0%, #0b1220 0%, var(--bg) 50%, #0b1220 100%);
+      color: var(--text);
+    }
+    .wrap { max-width: 1100px; margin: 24px auto; padding: 0 16px 48px; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel {
+      background: linear-gradient(180deg, #0b1220 0%, var(--panel) 100%);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+    }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input[type="text"], input[type="password"], textarea, select {
+      width: 100%;
+      background: #0b1220;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      outline: none;
+    }
+    textarea { min-height: 90px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .btn {
+      background: var(--accent);
+      color: #0b1220;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn.secondary { background: #1f2937; color: var(--text); }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .hidden { display: none; }
+    .preview {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px dashed var(--border);
+      display: grid;
+      place-items: center;
+      min-height: 240px;
+      background: #0b1220;
+    }
+    .preview img { max-width: 100%; max-height: 300px; image-rendering: pixelated; }
+    .thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 8px; }
+    .thumb { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; cursor: pointer; }
+    .thumb.active { border-color: var(--accent-2); box-shadow: 0 0 0 2px rgba(56,189,248,0.3); }
+    .thumb img { width: 100%; display: block; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .inline { display: flex; gap: 8px; align-items: center; }
+    .spacer { height: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Genera fotogrammi animati da immagine + prompt</h1>
+
+    <div class="grid">
+      <div class="panel">
+        <label>API Key Gemini</label>
+        <input id="apiKey" type="password" placeholder="Incolla la tua API Key" />
+
+        <div class="spacer"></div>
+        <label>Carica immagine di base</label>
+        <input id="spriteUpload" type="file" accept="image/*" />
+
+        <div id="spritePreview" class="preview hidden">
+          <img id="baseSprite" alt="base" />
+        </div>
+
+        <div class="spacer"></div>
+        <div class="row">
+          <div>
+            <label>Modello testo (analisi immagine)</label>
+            <input id="textModel" type="text" value="gemini-2.5-flash" />
+          </div>
+          <div>
+            <label>Modello immagini (generazione)</label>
+            <input id="imageModel" type="text" value="gemini-2.5-flash-image" />
+          </div>
+        </div>
+
+        <div class="spacer"></div>
+        <label>Descrizione soggetto (auto da analisi, puoi modificare)</label>
+        <textarea id="subjectDescription" placeholder="Clicca Analizza per descrivere l'immagine"></textarea>
+        <div class="inline">
+          <button id="analyzeBtn" class="btn secondary">Analizza immagine</button>
+          <span id="analyzeStatus" class="muted"></span>
+        </div>
+
+        <div class="spacer"></div>
+        <label>Animazione richiesta</label>
+        <textarea id="animationPrompt" placeholder="Es: il personaggio salta e atterra"></textarea>
+
+        <div class="spacer"></div>
+        <div class="row-3">
+          <div>
+            <label>Numero fotogrammi: <span id="frameCountDisplay">8</span></label>
+            <input id="frameCount" type="range" min="2" max="24" value="8" />
+          </div>
+          <div>
+            <label>Stile</label>
+            <select id="styleSelect">
+              <option value="pixel art">pixel art</option>
+              <option value="anime">anime</option>
+              <option value="illustrazione digitale">illustrazione digitale</option>
+              <option value="cartoon">cartoon</option>
+              <option value="realistico">realistico</option>
+            </select>
+          </div>
+          <div>
+            <label>FPS: <span id="fpsDisplay">8</span></label>
+            <input id="fpsSlider" type="range" min="2" max="24" value="8" />
+          </div>
+        </div>
+
+        <div class="spacer"></div>
+        <button id="generateBtn" class="btn">Genera fotogrammi</button>
+
+        <div id="loadingState" class="muted hidden" style="margin-top:10px;">
+          <div id="loadingText">Generazione in corso...</div>
+          <div id="progressText">0%</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div id="emptyState" class="preview">
+          <div class="muted">Nessun risultato ancora</div>
+        </div>
+
+        <div id="previewArea" class="hidden">
+          <div class="preview">
+            <img id="currentFrameDisplay" alt="frame" />
+          </div>
+          <div class="inline" style="margin-top:8px;">
+            <button id="playBtn" class="btn secondary">
+              <span id="playIcon">Play</span>
+              <span id="pauseIcon" class="hidden">Pausa</span>
+            </button>
+            <div id="frameInfo" class="muted">Frame 1/1</div>
+            <button id="downloadSheet" class="btn secondary">Scarica sprite sheet</button>
+          </div>
+          <div class="spacer"></div>
+          <div id="thumbnails" class="thumbs"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let baseSprite = null;
+    let generatedFrames = [];
+    let currentFrame = 0;
+    let isPlaying = false;
+    let playInterval = null;
+    let baseWidth = null;
+    let baseHeight = null;
+
+    const els = {
+      apiKey: document.getElementById('apiKey'),
+      spriteUpload: document.getElementById('spriteUpload'),
+      spritePreview: document.getElementById('spritePreview'),
+      baseSprite: document.getElementById('baseSprite'),
+      subjectDescription: document.getElementById('subjectDescription'),
+      animationPrompt: document.getElementById('animationPrompt'),
+      frameCount: document.getElementById('frameCount'),
+      frameCountDisplay: document.getElementById('frameCountDisplay'),
+      styleSelect: document.getElementById('styleSelect'),
+      generateBtn: document.getElementById('generateBtn'),
+      loadingState: document.getElementById('loadingState'),
+      loadingText: document.getElementById('loadingText'),
+      progressText: document.getElementById('progressText'),
+      previewArea: document.getElementById('previewArea'),
+      emptyState: document.getElementById('emptyState'),
+      currentFrameDisplay: document.getElementById('currentFrameDisplay'),
+      playBtn: document.getElementById('playBtn'),
+      playIcon: document.getElementById('playIcon'),
+      pauseIcon: document.getElementById('pauseIcon'),
+      frameInfo: document.getElementById('frameInfo'),
+      fpsSlider: document.getElementById('fpsSlider'),
+      fpsDisplay: document.getElementById('fpsDisplay'),
+      thumbnails: document.getElementById('thumbnails'),
+      downloadSheet: document.getElementById('downloadSheet'),
+      analyzeBtn: document.getElementById('analyzeBtn'),
+      analyzeStatus: document.getElementById('analyzeStatus'),
+      textModel: document.getElementById('textModel'),
+      imageModel: document.getElementById('imageModel')
+    };
+
+    function parseDataUrl(dataUrl) {
+      const [meta, b64] = dataUrl.split(',');
+      const mimeType = meta.split(':')[1].split(';')[0];
+      return { mimeType, b64 };
+    }
+
+    function getImageSize(dataUrl) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve({ width: img.width, height: img.height });
+        img.onerror = reject;
+        img.src = dataUrl;
+      });
+    }
+
+    async function resizeToBase(dataUrl) {
+      if (!baseWidth || !baseHeight) return dataUrl;
+      const img = new Image();
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      return await new Promise((resolve, reject) => {
+        img.onload = () => {
+          canvas.width = baseWidth;
+          canvas.height = baseHeight;
+          ctx.imageSmoothingEnabled = false;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, baseWidth, baseHeight);
+          resolve(canvas.toDataURL('image/png'));
+        };
+        img.onerror = reject;
+        img.src = dataUrl;
+      });
+    }
+
+    async function callGemini({ apiKey, model, parts, responseModalities }) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+      const body = { contents: [{ parts }] };
+      if (responseModalities) {
+        body.generationConfig = { responseModalities };
+      }
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        body: JSON.stringify(body)
+      });
+
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = json?.error?.message || JSON.stringify(json) || `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+      return json;
+    }
+
+    function extractText(partsOut) {
+      return partsOut.map(p => p.text).filter(Boolean).join('\n').trim();
+    }
+
+    async function callGeminiText({ apiKey, model, parts }) {
+      const json = await callGemini({ apiKey, model, parts });
+      const partsOut = json?.candidates?.[0]?.content?.parts || [];
+      const text = extractText(partsOut);
+      if (!text) throw new Error('Nessun testo nella risposta.');
+      return text;
+    }
+
+    async function callGeminiImage({ apiKey, model, parts }) {
+      const json = await callGemini({ apiKey, model, parts, responseModalities: ['Image'] });
+      const partsOut = json?.candidates?.[0]?.content?.parts || [];
+      const imgPart = partsOut.find(p => p.inlineData?.data) || partsOut.find(p => p.inline_data?.data);
+      const inline = imgPart?.inlineData || imgPart?.inline_data;
+      if (!inline?.data) {
+        const text = extractText(partsOut);
+        throw new Error('Nessuna immagine nella risposta. ' + (text ? `Testo: ${text}` : ''));
+      }
+      const mime = inline.mimeType || inline.mime_type || 'image/png';
+      return `data:${mime};base64,${inline.data}`;
+    }
+
+    async function analyzeImage({ apiKey, imageDataUrl }) {
+      const { mimeType, b64 } = parseDataUrl(imageDataUrl);
+      const instruction =
+        'Descrivi in modo preciso il soggetto principale, stile, colori e inquadratura. ' +
+        'Non inventare elementi non presenti. Rispondi con 1-3 frasi concise.';
+
+      const parts = [
+        { text: instruction },
+        { inlineData: { mimeType, data: b64 } }
+      ];
+
+      return await callGeminiText({ apiKey, model: els.textModel.value.trim(), parts });
+    }
+
+    async function generateNextFrameWithGemini({ apiKey, prevFrameDataUrl, userPrompt, style, frameIndex, frameTotal, subjectDescription }) {
+      const { mimeType, b64 } = parseDataUrl(prevFrameDataUrl);
+      const instruction =
+        "Genera il frame successivo di un'animazione sprite.\n" +
+        "Vincoli:\n" +
+        "- Mantieni IDENTICO personaggio/oggetto, stile e palette del frame precedente.\n" +
+        "- Cambia SOLO la posa in modo minimo e coerente con l'animazione richiesta.\n" +
+        "- Inquadratura fissa, stesso zoom, stessa posizione generale.\n" +
+        "- Nessun testo, nessun elemento nuovo, sfondo pulito (se possibile trasparente).\n" +
+        `- Risoluzione identica al frame precedente: ${baseWidth || '??'}x${baseHeight || '??'}.\n\n` +
+        `Descrizione soggetto: ${subjectDescription || 'non specificata'}\n` +
+        `Stile desiderato: ${style}\n` +
+        `Animazione: ${userPrompt}\n` +
+        `Stai generando frame ${frameIndex + 1} di ${frameTotal} (questo e il frame successivo al precedente).`;
+
+      const parts = [
+        { text: instruction },
+        { inlineData: { mimeType, data: b64 } }
+      ];
+
+      const dataUrl = await callGeminiImage({ apiKey, model: els.imageModel.value.trim(), parts });
+      return await resizeToBase(dataUrl);
+    }
+
+    els.spriteUpload.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        baseSprite = ev.target.result;
+        els.baseSprite.src = baseSprite;
+        els.spritePreview.classList.remove('hidden');
+
+        getImageSize(baseSprite).then((size) => {
+          baseWidth = size.width;
+          baseHeight = size.height;
+        }).catch(() => {
+          baseWidth = null;
+          baseHeight = null;
+        });
+
+        generatedFrames = [];
+        currentFrame = 0;
+        stopAnimation();
+
+        els.previewArea.classList.add('hidden');
+        els.emptyState.classList.remove('hidden');
+      };
+      reader.readAsDataURL(file);
+    });
+
+    els.frameCount.addEventListener('input', (e) => {
+      els.frameCountDisplay.textContent = e.target.value;
+    });
+
+    els.fpsSlider.addEventListener('input', (e) => {
+      els.fpsDisplay.textContent = e.target.value;
+      if (isPlaying) {
+        stopAnimation();
+        startAnimation();
+      }
+    });
+
+    els.analyzeBtn.addEventListener('click', async () => {
+      const apiKey = els.apiKey.value.trim();
+      if (!apiKey) return alert('Inserisci la tua API Key.');
+      if (!baseSprite) return alert('Carica un\'immagine.');
+
+      els.analyzeStatus.textContent = 'Analisi in corso...';
+      els.analyzeBtn.disabled = true;
+
+      try {
+        const desc = await analyzeImage({ apiKey, imageDataUrl: baseSprite });
+        els.subjectDescription.value = desc;
+        els.analyzeStatus.textContent = 'Analisi completata.';
+      } catch (err) {
+        els.analyzeStatus.textContent = '';
+        alert('Errore analisi: ' + (err?.message || String(err)));
+      } finally {
+        els.analyzeBtn.disabled = false;
+      }
+    });
+
+    els.generateBtn.addEventListener('click', async () => {
+      const apiKey = els.apiKey.value.trim();
+      if (!apiKey) return alert('Inserisci la tua API Key.');
+      if (!baseSprite) return alert('Carica un\'immagine.');
+      const userPrompt = els.animationPrompt.value.trim();
+      if (!userPrompt) return alert('Descrivi l' + "'" + 'animazione.');
+
+      const frameTotal = parseInt(els.frameCount.value, 10);
+      const style = els.styleSelect.value;
+      const subjectDescription = els.subjectDescription.value.trim();
+
+      els.emptyState.classList.add('hidden');
+      els.previewArea.classList.add('hidden');
+      els.loadingState.classList.remove('hidden');
+      els.generateBtn.disabled = true;
+
+      generatedFrames = [];
+      currentFrame = 0;
+      stopAnimation();
+
+      try {
+        generatedFrames.push(baseSprite);
+        let prev = baseSprite;
+
+        for (let i = 1; i < frameTotal; i++) {
+          els.loadingText.textContent = `Generando frame ${i + 1}/${frameTotal}...`;
+          els.progressText.textContent = `${Math.round((i / frameTotal) * 100)}% completato`;
+
+          const next = await generateNextFrameWithGemini({
+            apiKey,
+            prevFrameDataUrl: prev,
+            userPrompt,
+            style,
+            frameIndex: i,
+            frameTotal,
+            subjectDescription
+          });
+
+          generatedFrames.push(next);
+          prev = next;
+        }
+
+        els.loadingState.classList.add('hidden');
+        showResults();
+      } catch (error) {
+        console.error(error);
+        alert('Errore: ' + (error?.message || String(error)));
+        els.loadingState.classList.add('hidden');
+        els.emptyState.classList.remove('hidden');
+      } finally {
+        els.generateBtn.disabled = false;
+      }
+    });
+
+    function showResults() {
+      els.previewArea.classList.remove('hidden');
+      currentFrame = 0;
+      updatePreview();
+      renderThumbnails();
+    }
+
+    function updatePreview() {
+      if (!generatedFrames.length) return;
+      els.currentFrameDisplay.src = generatedFrames[currentFrame];
+      els.frameInfo.textContent = `Frame ${currentFrame + 1}/${generatedFrames.length}`;
+      document.querySelectorAll('.thumb').forEach((t, i) => {
+        t.classList.toggle('active', i === currentFrame);
+      });
+    }
+
+    function renderThumbnails() {
+      els.thumbnails.innerHTML = '';
+      generatedFrames.forEach((frame, i) => {
+        const div = document.createElement('div');
+        div.className = 'thumb' + (i === currentFrame ? ' active' : '');
+        div.onclick = () => { currentFrame = i; updatePreview(); };
+        const img = document.createElement('img');
+        img.src = frame;
+        div.appendChild(img);
+        els.thumbnails.appendChild(div);
+      });
+    }
+
+    els.playBtn.addEventListener('click', () => {
+      if (!generatedFrames.length) return;
+      if (isPlaying) stopAnimation();
+      else startAnimation();
+    });
+
+    function startAnimation() {
+      if (generatedFrames.length === 0) return;
+      isPlaying = true;
+      els.playIcon.classList.add('hidden');
+      els.pauseIcon.classList.remove('hidden');
+
+      const fps = parseInt(els.fpsSlider.value, 10) || 8;
+      playInterval = setInterval(() => {
+        currentFrame = (currentFrame + 1) % generatedFrames.length;
+        updatePreview();
+      }, 1000 / fps);
+    }
+
+    function stopAnimation() {
+      isPlaying = false;
+      els.playIcon.classList.remove('hidden');
+      els.pauseIcon.classList.add('hidden');
+      if (playInterval) clearInterval(playInterval);
+      playInterval = null;
+    }
+
+    els.downloadSheet.addEventListener('click', () => {
+      if (!generatedFrames.length) return;
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+
+      const first = new Image();
+      first.onload = () => {
+        canvas.width = first.width * generatedFrames.length;
+        canvas.height = first.height;
+
+        let loaded = 0;
+
+        generatedFrames.forEach((frame, i) => {
+          const frameImg = new Image();
+          frameImg.onload = () => {
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(frameImg, i * first.width, 0);
+            if (++loaded === generatedFrames.length) {
+              const a = document.createElement('a');
+              a.download = 'sprite-sheet.png';
+              a.href = canvas.toDataURL('image/png');
+              a.click();
+            }
+          };
+          frameImg.src = frame;
+        });
+      };
+      first.src = generatedFrames[0];
+    });
+  </script>
+</body>
+</html>

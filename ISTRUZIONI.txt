@@ -1,0 +1,100 @@
+﻿Istruzioni - Sprite Animator (Desktop PySide6)
+
+Data: 11 febbraio 2026
+
+Panoramica
+L'app desktop in `app_pyside6.py` lavora in 2 stadi:
+1) simulazione rig (scheletro vettoriale)
+2) generazione raster finale (Stable Diffusion + ControlNet)
+
+Flusso consigliato
+1. Carica il frame 1 (tasto destro sulla miniatura).
+2. Imposta keyframe (checkbox `key`) dove serve.
+3. Modifica il rig in preview (drag nodi, split/merge topologia su frame 1).
+4. Premi `simula rig`.
+5. Controlla con onion skin e correggi.
+6. Premi `approva rig`.
+7. Premi `genera raster`.
+
+Importante: `genera raster` è abilitato solo dopo `approva rig`.
+Se modifichi il rig, l'approvazione viene rimossa automaticamente.
+
+File principali
+- `app_pyside6.py`: app desktop principale
+- `app.py`: versione Streamlit (web)
+- `requirements.txt`: dipendenze
+
+Installazione
+1. Crea ambiente virtuale (consigliato)
+   `python -m venv .venv`
+   `.venv\Scripts\activate`
+2. Installa dipendenze
+   `pip install -r requirements.txt`
+
+Avvio desktop
+`python app_pyside6.py`
+
+Descrizione immagine (Gemini)
+- Inserisci API key Gemini nel pannello sinistro.
+- Spunta `Usa Gemini per descrizione`.
+- Usa `Ricalcola descrizione` per aggiornare la caption del frame selezionato.
+- Il log in basso mostra sempre quale engine è stato usato (`gemini` o `fallback`).
+
+Rig e topologia
+- Il frame 1 definisce la topologia globale (nodi + segmenti).
+- Solo sul frame 1 puoi cambiare il numero di nodi/segmenti:
+  - tasto destro su nodo: elimina nodo
+  - tasto destro su segmento: split (inserisce nodo a metà e spezza in due segmenti)
+  - shift + drag su nodo e rilascio sopra altro nodo: merge nodi
+- Su frame > 1 la topologia non è modificabile.
+
+Editing nodi
+- Drag normale: mantiene vincoli lunghezza segmenti.
+- Shift + drag: spostamento libero del solo nodo (senza vincoli), utile per correggere lunghezze.
+
+Frame e timeline
+- Click sinistro su miniatura: seleziona frame.
+- Click destro su miniatura: apre file picker per caricare immagine.
+- Drag&drop tra miniature: menu `sposta / duplica / annulla`.
+- Bottone `trash` per cancellare il singolo frame.
+
+Dettaglio frame
+Nel popup `dettaglio`:
+- risoluzione
+- brightness / contrast / saturation
+- chroma key opzionale (`Attiva trasparenza colore`)
+- key color + tolerance
+- descrizione keyframe (solo se frame con `key` attiva)
+
+Contagocce trasparenza
+- Premi `contagocce`.
+- Clicca un colore in preview.
+- Quel colore viene reso trasparente subito sul frame selezionato.
+- `tol` regola la tolleranza colore.
+
+Onion skin
+- Checkbox `onion skin` per sovrapporre frame vicini.
+- `range` definisce quanti frame coinvolgere.
+
+Requisiti modelli (solo per raster finale)
+Per `genera raster` servono modelli locali:
+- Stable Diffusion 1.5 (~4 GB)
+- ControlNet OpenPose (~1.4 GB)
+Totale indicativo: 5.5-6 GB
+
+Nota: `simula rig` NON richiede Stable Diffusion/ControlNet.
+
+GPU/CPU
+- CPU funziona ma è lenta.
+- Con GPU NVIDIA i tempi migliorano molto.
+
+Cache Hugging Face
+Percorso default: `C:\Users\<utente>\.cache\huggingface`
+Per spostarla:
+`setx HF_HOME D:\hf_cache`
+(aprire nuovo terminale dopo `setx`)
+
+Troubleshooting rapido
+- Se parte il browser: stai avviando `app.py` (Streamlit), non `app_pyside6.py`.
+- Se descrizione non cambia: controlla log in basso (engine usato / errori API).
+- Se `genera raster` non è cliccabile: devi prima fare `approva rig`.

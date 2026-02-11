@@ -1,0 +1,14 @@
+﻿{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "PySide6: app_pyside6.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app_pyside6.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

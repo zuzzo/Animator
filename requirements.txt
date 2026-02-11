@@ -1,0 +1,10 @@
+﻿streamlit
+pillow
+torch
+diffusers
+transformers
+accelerate
+safetensors
+controlnet-aux
+numpy
+PySide6
