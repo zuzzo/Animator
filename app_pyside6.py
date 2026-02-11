@@ -690,7 +690,11 @@ class VectorPreviewWidget(QWidget):
                 return Image.new("RGBA", ref.size, (255, 255, 255, 0))
             return None
         if self.parent_win.chk_sprite.isChecked():
-            base_src = fr.generated or (compose_with_offset(fr.image, fr.image_offset) if fr.image is not None else None)
+            # During eyedropper mode always show/edit the base bitmap layer.
+            if self.parent_win.eyedropper_mode and fr.image is not None:
+                base_src = compose_with_offset(fr.image, fr.image_offset)
+            else:
+                base_src = fr.generated or (compose_with_offset(fr.image, fr.image_offset) if fr.image is not None else None)
             if base_src is None:
                 ref = self.parent_win.frames[0].image
                 if ref is not None:
@@ -748,13 +752,13 @@ class VectorPreviewWidget(QWidget):
     def _closest_node(self, pt: QPoint, rect: QRect, fr: FrameData, threshold: int = 12) -> Optional[str]:
         if fr.rig_nodes is None:
             return None
-        img = fr.generated or fr.image
-        if img is None:
+        canvas_size = self.parent_win.get_frame_canvas_size(self.parent_win.selected_index)
+        if canvas_size is None:
             return None
         best = None
         best_d = threshold
         for n, (x, y) in fr.rig_nodes.items():
-            wx, wy = self._image_to_widget(x, y, rect, img.size)
+            wx, wy = self._image_to_widget(x, y, rect, canvas_size)
             d = math.hypot(pt.x() - wx, pt.y() - wy)
             if d <= best_d:
                 best = n
@@ -764,16 +768,16 @@ class VectorPreviewWidget(QWidget):
     def _closest_bone(self, pt: QPoint, rect: QRect, fr: FrameData, threshold: float = 10.0) -> Optional[Tuple[str, str]]:
         if fr.rig_nodes is None:
             return None
-        img = fr.generated or fr.image
-        if img is None:
+        canvas_size = self.parent_win.get_frame_canvas_size(self.parent_win.selected_index)
+        if canvas_size is None:
             return None
         best_bone = None
         best_d = threshold
         for a, b in self._frame_bones(fr):
             if a not in fr.rig_nodes or b not in fr.rig_nodes:
                 continue
-            ax, ay = self._image_to_widget(fr.rig_nodes[a][0], fr.rig_nodes[a][1], rect, img.size)
-            bx, by = self._image_to_widget(fr.rig_nodes[b][0], fr.rig_nodes[b][1], rect, img.size)
+            ax, ay = self._image_to_widget(fr.rig_nodes[a][0], fr.rig_nodes[a][1], rect, canvas_size)
+            bx, by = self._image_to_widget(fr.rig_nodes[b][0], fr.rig_nodes[b][1], rect, canvas_size)
             px, py = pt.x(), pt.y()
             vx, vy = bx - ax, by - ay
             wx, wy = px - ax, py - ay
@@ -793,15 +797,15 @@ class VectorPreviewWidget(QWidget):
     def _closest_other_node(self, pt: QPoint, rect: QRect, fr: FrameData, exclude: str, threshold: float = 12.0) -> Optional[str]:
         if fr.rig_nodes is None:
             return None
-        img = fr.generated or fr.image
-        if img is None:
+        canvas_size = self.parent_win.get_frame_canvas_size(self.parent_win.selected_index)
+        if canvas_size is None:
             return None
         best = None
         best_d = threshold
         for n, (x, y) in fr.rig_nodes.items():
             if n == exclude:
                 continue
-            wx, wy = self._image_to_widget(x, y, rect, img.size)
+            wx, wy = self._image_to_widget(x, y, rect, canvas_size)
             d = math.hypot(pt.x() - wx, pt.y() - wy)
             if d <= best_d:
                 best = n
@@ -897,12 +901,12 @@ class VectorPreviewWidget(QWidget):
         if self.drag_node is None:
             return
         fr = self.parent_win.frames[self.parent_win.selected_index]
-        img = fr.generated or fr.image
-        if img is None or fr.rig_nodes is None or fr.bone_lengths is None or self._img_rect is None:
+        canvas_size = self.parent_win.get_frame_canvas_size(self.parent_win.selected_index)
+        if canvas_size is None or fr.rig_nodes is None or fr.bone_lengths is None or self._img_rect is None:
             return
-        nx, ny = self._widget_to_image(event.position().toPoint(), self._img_rect, img.size)
-        nx = max(0.0, min(float(img.width - 1), nx))
-        ny = max(0.0, min(float(img.height - 1), ny))
+        nx, ny = self._widget_to_image(event.position().toPoint(), self._img_rect, canvas_size)
+        nx = max(0.0, min(float(canvas_size[0] - 1), nx))
+        ny = max(0.0, min(float(canvas_size[1] - 1), ny))
         fr.rig_nodes[self.drag_node] = (nx, ny)
         free_edit = bool(event.modifiers() & Qt.ShiftModifier)
         if not free_edit:
@@ -1032,6 +1036,8 @@ class MainWindow(QMainWindow):
         self.selected_index = 0
         self.thumbs: List[ThumbButton] = []
         self.eyedropper_mode: bool = False
+        self._pose_visible_before_eyedropper: bool = True
+        self.last_eyedrop_color: Tuple[int, int, int] = (0, 0, 0)
         self.rig_approved: bool = False
         self.topology_bones: Optional[List[Tuple[str, str]]] = None
         self.topology_new_node_counter: int = 1
@@ -1183,6 +1189,10 @@ class MainWindow(QMainWindow):
         self.eyedropper_tol = QSpinBox()
         self.eyedropper_tol.setRange(0, 80)
         self.eyedropper_tol.setValue(10)
+        self.eyedropper_color_chip = QLabel()
+        self.eyedropper_color_chip.setFixedSize(22, 22)
+        self.eyedropper_color_chip.setToolTip("Ultimo colore selezionato")
+        self._update_eyedropper_chip()
         right_bottom.addWidget(self.chk_onion)
         right_bottom.addWidget(QLabel("range"))
         right_bottom.addWidget(self.onion_range)
@@ -1190,6 +1200,8 @@ class MainWindow(QMainWindow):
         right_bottom.addWidget(self.preview_move_step)
         right_bottom.addWidget(QLabel("tol"))
         right_bottom.addWidget(self.eyedropper_tol)
+        right_bottom.addWidget(QLabel("col"))
+        right_bottom.addWidget(self.eyedropper_color_chip)
         right_bottom.addStretch(1)
 
         right_panel.addLayout(right_top)
@@ -1283,7 +1295,22 @@ class MainWindow(QMainWindow):
 
     def toggle_eyedropper_mode(self, enabled: bool):
         self.eyedropper_mode = bool(enabled)
+        if enabled:
+            self.chk_sprite.setChecked(True)
+            self._pose_visible_before_eyedropper = self.chk_pose.isChecked()
+            self.chk_pose.setChecked(False)
+        if self.eyedropper_mode:
+            self.preview.setCursor(Qt.CrossCursor)
+        else:
+            self.preview.unsetCursor()
+            self.chk_pose.setChecked(self._pose_visible_before_eyedropper)
         self.log("Contagocce attivo: clicca un colore nella preview" if enabled else "Contagocce disattivato")
+
+    def _update_eyedropper_chip(self):
+        r, g, b = self.last_eyedrop_color
+        self.eyedropper_color_chip.setStyleSheet(
+            f"background: rgb({r},{g},{b}); border: 1px solid #334155;"
+        )
 
     def apply_eyedropper_pixel(self, x: int, y: int):
         fr = self.frames[self.selected_index]
@@ -1294,40 +1321,39 @@ class MainWindow(QMainWindow):
         y = int(y)
         tol = self.eyedropper_tol.value()
 
-        # If a generated raster is visible, apply key directly on it.
-        if fr.generated is not None:
-            sample_img = fr.generated.convert("RGBA")
-            x = max(0, min(sample_img.width - 1, x))
-            y = max(0, min(sample_img.height - 1, y))
-            r, g, b, a = sample_img.getpixel((x, y))
-            if a == 0:
-                self.log("Contagocce: pixel gia trasparente, nessuna modifica")
-                return
-            fr.generated = apply_chroma_key(fr.generated, (r, g, b), tol)
-            self.frames[self.selected_index] = fr
-            self.detail_dialog.key_enabled.setChecked(True)
-            self.detail_dialog.key_color.setText(f"#{r:02x}{g:02x}{b:02x}")
-            self.detail_dialog.key_tol.setValue(tol)
-            self.log(f"Contagocce: rimosso colore su layer generated #{r:02x}{g:02x}{b:02x} (tol={tol})")
-        else:
-            # Base image uses logical offset; map preview click back to source coordinates.
-            ox, oy = fr.image_offset
-            sx = x - ox
-            sy = y - oy
-            if sx < 0 or sy < 0 or sx >= fr.image.width or sy >= fr.image.height:
-                self.log("Contagocce: click fuori dal raster (offset attivo), nessuna modifica")
-                return
-            src = fr.image.convert("RGBA")
-            r, g, b, a = src.getpixel((sx, sy))
-            if a == 0:
-                self.log("Contagocce: pixel gia trasparente, nessuna modifica")
-                return
-            fr.image = apply_chroma_key(fr.image, (r, g, b), tol)
-            self.frames[self.selected_index] = fr
-            self.detail_dialog.key_enabled.setChecked(True)
-            self.detail_dialog.key_color.setText(f"#{r:02x}{g:02x}{b:02x}")
-            self.detail_dialog.key_tol.setValue(tol)
-            self.log(f"Contagocce: rimosso colore su layer base #{r:02x}{g:02x}{b:02x} (tol={tol})")
+        # Always operate on the base bitmap layer.
+        if fr.image is None and fr.generated is not None:
+            fr.image = fr.generated.convert("RGBA")
+            fr.generated = None
+
+        if fr.image is None:
+            self.log("Contagocce: nessun bitmap base disponibile")
+            return
+
+        ox, oy = fr.image_offset
+        sx = x - ox
+        sy = y - oy
+        if sx < 0 or sy < 0 or sx >= fr.image.width or sy >= fr.image.height:
+            self.log("Contagocce: click fuori dal bitmap (offset attivo), nessuna modifica")
+            return
+
+        src = fr.image.convert("RGBA")
+        r, g, b, a = src.getpixel((sx, sy))
+        if a == 0:
+            self.log("Contagocce: pixel gia trasparente, nessuna modifica")
+            return
+
+        fr.image = apply_chroma_key(fr.image, (r, g, b), tol)
+        # Clear generated layer to avoid masking the edited bitmap.
+        fr.generated = None
+        self.frames[self.selected_index] = fr
+
+        self.detail_dialog.key_enabled.setChecked(True)
+        self.detail_dialog.key_color.setText(f"#{r:02x}{g:02x}{b:02x}")
+        self.detail_dialog.key_tol.setValue(tol)
+        self.last_eyedrop_color = (r, g, b)
+        self._update_eyedropper_chip()
+        self.log(f"Contagocce: rimosso colore bitmap #{r:02x}{g:02x}{b:02x} (tol={tol})")
 
         self.frames[self.selected_index] = fr
 
@@ -1377,6 +1403,23 @@ class MainWindow(QMainWindow):
 
     def update_frame_label(self):
         self.frame_label.setText(f"FRAME {self.selected_index + 1}/{len(self.frames)}")
+
+    def get_frame_canvas_size(self, idx: int) -> Optional[Tuple[int, int]]:
+        if idx < 0 or idx >= len(self.frames):
+            return None
+        fr = self.frames[idx]
+        if fr.generated is not None:
+            return fr.generated.size
+        if fr.image is not None:
+            return fr.image.size
+        # Rig-only frames inherit canvas from frame 1 if available.
+        fr0 = self.frames[0] if self.frames else None
+        if fr0 is not None:
+            if fr0.generated is not None:
+                return fr0.generated.size
+            if fr0.image is not None:
+                return fr0.image.size
+        return None
 
     def on_frame_count_changed(self, n: int):
         cur = len(self.frames)
