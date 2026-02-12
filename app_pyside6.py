@@ -442,9 +442,9 @@ def scale_rig_nodes(nodes: Dict[str, Tuple[float, float]], old_size: Tuple[int, 
 def apply_chroma_key(img: Image.Image, key_rgb: tuple, tol: int) -> Image.Image:
     rgba = img.convert("RGBA")
     data = np.array(rgba)
-    r = data[..., 0]
-    g = data[..., 1]
-    b = data[..., 2]
+    r = data[..., 0].astype(np.int16)
+    g = data[..., 1].astype(np.int16)
+    b = data[..., 2].astype(np.int16)
     kr, kg, kb = key_rgb
     mask = (
         (np.abs(r - kr) <= tol)
