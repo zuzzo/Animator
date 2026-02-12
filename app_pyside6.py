@@ -4,6 +4,7 @@ import math
 import sys
 import zipfile
 import base64
+import json
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -440,14 +441,19 @@ def scale_rig_nodes(nodes: Dict[str, Tuple[float, float]], old_size: Tuple[int, 
 def apply_chroma_key(img: Image.Image, key_rgb: tuple, tol: int) -> Image.Image:
     rgba = img.convert("RGBA")
     data = np.array(rgba)
-    r, g, b, _ = data.T
+    r = data[..., 0]
+    g = data[..., 1]
+    b = data[..., 2]
     kr, kg, kb = key_rgb
     mask = (
         (np.abs(r - kr) <= tol)
         & (np.abs(g - kg) <= tol)
         & (np.abs(b - kb) <= tol)
     )
-    data[..., 3] = np.where(mask, 0, data[..., 3])
+    alpha = data[..., 3]
+    if mask.shape != alpha.shape and mask.T.shape == alpha.shape:
+        mask = mask.T
+    data[..., 3] = np.where(mask, 0, alpha)
     return Image.fromarray(data)
 
 
@@ -572,6 +578,102 @@ def gemini_describe_image(api_key: str, model: str, img: Image.Image, hint: str 
     if not text:
         raise RuntimeError("Gemini non ha restituito testo.")
     return text
+
+
+def gemini_generate_rig_animation(
+    api_key: str,
+    model: str,
+    base_nodes: Dict[str, Tuple[float, float]],
+    bones: List[Tuple[str, str]],
+    frame_count: int,
+    prompt: str,
+    key_descriptions: Dict[int, str],
+) -> List[Dict[str, Tuple[float, float]]]:
+    # Ask Gemini for normalized coordinates per frame (0..1)
+    node_list = list(base_nodes.keys())
+    skeleton_hint = "; ".join([f"{a}-{b}" for a, b in bones])
+    key_hint = ", ".join([f"{k+1}:{v}" for k, v in key_descriptions.items() if v])
+    example = (
+        '{\n'
+        '  "frames": [\n'
+        '    {"nodes": {"hip": [0.5, 0.6], "neck": [0.5, 0.35]}},\n'
+        '    {"nodes": {"hip": [0.5, 0.6], "neck": [0.5, 0.33]}}\n'
+        '  ]\n'
+        '}\n'
+    )
+    instruction = (
+        "Genera una animazione di rig per sprite 2D.\n"
+        "Output richiesto: JSON con campo 'frames' (lista lunga esattamente N),\n"
+        "ogni frame ha 'nodes' con coordinate normalizzate 0..1 per ciascun nodo.\n"
+        "Non inventare nodi extra. Usa solo quelli forniti.\n"
+        "Mantieni coerenza e movimento fluido.\n"
+        f"N={frame_count}\n"
+        f"Nodi: {', '.join(node_list)}\n"
+        f"Segmenti: {skeleton_hint}\n"
+        f"Prompt animazione: {prompt}\n"
+        f"Descrizioni keyframe (opzionale): {key_hint}\n"
+        "Rispondi SOLO con JSON valido, senza testo extra o markdown.\n"
+        "Esempio formato:\n"
+        f"{example}"
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {"contents": [{"parts": [{"text": instruction}]}]}
+
+    last_err = None
+    text = ""
+    for attempt in range(3):
+        try:
+            res = requests.post(
+                url,
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                json=body,
+                timeout=120,
+            )
+            if not res.ok:
+                raise RuntimeError(f"Gemini error {res.status_code}: {res.text[:240]}")
+            payload = res.json()
+            parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            text = "\n".join([p.get("text", "") for p in parts if p.get("text")]).strip()
+            if text:
+                break
+        except Exception as e:
+            last_err = e
+    if not text:
+        raise RuntimeError(f"Nessuna risposta valida da Gemini. Ultimo errore: {last_err}")
+    if not text:
+        raise RuntimeError("Gemini non ha restituito testo.")
+    # Try to parse JSON; if model wrapped it, extract the first JSON object.
+    try:
+        data = json.loads(text)
+    except Exception:
+        import re
+        # Try to extract JSON from code fences or any brace block.
+        m = re.search(r"```json\\s*(\\{[\\s\\S]*?\\})\\s*```", text)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+            except Exception as e:
+                raise RuntimeError(f"JSON non valido: {e}")
+        m = re.search(r"\\{[\\s\\S]*\\}", text)
+        if not m:
+            raise RuntimeError("JSON non valido: nessun oggetto JSON trovato.")
+        try:
+            data = json.loads(m.group(0))
+        except Exception as e:
+            raise RuntimeError(f"JSON non valido: {e}")
+    frames = data.get("frames")
+    if not isinstance(frames, list) or len(frames) != frame_count:
+        raise RuntimeError("Output JSON non valido: frames mancante o lunghezza errata.")
+    out: List[Dict[str, Tuple[float, float]]] = []
+    for f in frames:
+        nodes = f.get("nodes", {}) if isinstance(f, dict) else {}
+        frame_nodes: Dict[str, Tuple[float, float]] = {}
+        for n in node_list:
+            v = nodes.get(n)
+            if isinstance(v, list) and len(v) == 2:
+                frame_nodes[n] = (float(v[0]), float(v[1]))
+        out.append(frame_nodes)
+    return out
 
 
 def preprocess_for_caption(img: Image.Image) -> Image.Image:
@@ -1111,6 +1213,8 @@ class MainWindow(QMainWindow):
 
         self.btn_generate_pose = QPushButton("simula rig")
         self.btn_generate_pose.clicked.connect(self.simulate_rig_animation)
+        self.btn_ai_rig = QPushButton("AI rig")
+        self.btn_ai_rig.clicked.connect(self.generate_rig_with_ai)
         self.btn_approve_rig = QPushButton("approva rig")
         self.btn_approve_rig.setCheckable(True)
         self.btn_approve_rig.toggled.connect(self.set_rig_approved)
@@ -1119,6 +1223,7 @@ class MainWindow(QMainWindow):
         self.btn_generate_frames.setEnabled(False)
 
         left_layout.addWidget(self.btn_generate_pose)
+        left_layout.addWidget(self.btn_ai_rig)
         left_layout.addWidget(self.btn_approve_rig)
         left_layout.addWidget(self.btn_generate_frames)
 
@@ -1861,9 +1966,9 @@ class MainWindow(QMainWindow):
                     hint=self.caption_hint.toPlainText().strip(),
                 )
                 self.log(f"[caption] Auto descrizione frame {idx + 1} con Gemini")
-            except Exception:
+            except Exception as e:
                 cap = cap or ""
-                self.log(f"[caption] Gemini non disponibile sul frame {idx + 1}, mantengo/fallback")
+                self.log(f"[caption] Errore Gemini su frame {idx + 1}: {e}")
         elif CAPTION_OK and (self.frames[idx].is_keyframe or self.frames[idx].rig_profile == "auto"):
             try:
                 cap = caption_image(img)
@@ -1983,6 +2088,49 @@ class MainWindow(QMainWindow):
     def fill_missing_poses(self):
         self.simulate_rig_animation()
 
+    def generate_rig_with_ai(self):
+        if not self.gemini_api_key.text().strip():
+            QMessageBox.warning(self, "AI rig", "Inserisci la API key Gemini per usare AI rig.")
+            self.log("[AI rig] Errore: API key mancante")
+            return
+        fr0 = self.frames[0]
+        if fr0.rig_nodes is None or fr0.image is None:
+            QMessageBox.warning(self, "AI rig", "Carica e prepara il frame 1 prima di generare l'animazione.")
+            self.log("[AI rig] Errore: frame 1 non pronto (rig o immagine mancante)")
+            return
+        bones = self.get_frame_bones(fr0)
+        key_descs = {i: fr.key_description for i, fr in enumerate(self.frames) if fr.is_keyframe and fr.key_description}
+        self.log("[AI rig] Richiesta inviata a Gemini")
+        try:
+            frames_norm = gemini_generate_rig_animation(
+                self.gemini_api_key.text().strip(),
+                self.gemini_model.text().strip() or "gemini-2.5-flash",
+                fr0.rig_nodes,
+                bones,
+                len(self.frames),
+                self.prompt.toPlainText().strip(),
+                key_descs,
+            )
+        except Exception as e:
+            self.log(f"[AI rig] Errore: {e}")
+            QMessageBox.warning(self, "AI rig", f"Errore: {e}")
+            return
+
+        w, h = fr0.image.size
+        for i, frame_nodes in enumerate(frames_norm):
+            if not frame_nodes:
+                continue
+            abs_nodes = {}
+            for n, (nx, ny) in frame_nodes.items():
+                x = max(0.0, min(1.0, nx)) * (w - 1)
+                y = max(0.0, min(1.0, ny)) * (h - 1)
+                abs_nodes[n] = (x, y)
+            self.frames[i].rig_nodes = abs_nodes
+            self.frames[i].bone_lengths = compute_bone_lengths(abs_nodes, self.get_frame_bones(self.frames[i]))
+        self.mark_rig_dirty()
+        self.refresh_ui()
+        self.log("[AI rig] Animazione rig generata")
+
     def generate_final_frames(self):
         if not self.rig_approved:
             QMessageBox.warning(self, "Attenzione", "Approva prima il rig (pulsante 'approva rig').")
@@ -2058,6 +2206,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

@@ -8,3 +8,4 @@ safetensors
 controlnet-aux
 numpy
 PySide6
+requests
