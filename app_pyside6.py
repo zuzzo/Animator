@@ -14,7 +14,7 @@ import numpy as np
 import requests
 import torch
 from PIL import Image, ImageEnhance, ImageOps, ImageDraw, ImageFilter
-from PySide6.QtCore import QMimeData, QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QMimeData, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QDrag, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -1172,6 +1172,10 @@ class MainWindow(QMainWindow):
         self.rig_approved: bool = False
         self.topology_bones: Optional[List[Tuple[str, str]]] = None
         self.topology_new_node_counter: int = 1
+        self.playing: bool = False
+        self.play_timer = QTimer(self)
+        self.play_timer.setInterval(120)
+        self.play_timer.timeout.connect(self.on_play_tick)
 
         self.detail_dialog = DetailDialog(self)
         self.build_menu()
@@ -1274,6 +1278,10 @@ class MainWindow(QMainWindow):
         self.btn_detail = QPushButton("dettaglio")
         self.btn_detail.clicked.connect(self.open_detail)
         right_top.addWidget(self.btn_detail)
+        self.btn_play = QPushButton("play")
+        self.btn_play.setCheckable(True)
+        self.btn_play.toggled.connect(self.toggle_play)
+        right_top.addWidget(self.btn_play)
         right_top.addStretch(1)
         self.chk_sprite = QCheckBox("raster")
         self.chk_sprite.setChecked(True)
@@ -1581,6 +1589,14 @@ class MainWindow(QMainWindow):
                 self.frame_slider.setValue(len(self.frames))
                 self.frame_slider.blockSignals(False)
 
+                self.playing = False
+                self.play_timer.stop()
+                if hasattr(self, "btn_play"):
+                    self.btn_play.blockSignals(True)
+                    self.btn_play.setChecked(False)
+                    self.btn_play.setText("play")
+                    self.btn_play.blockSignals(False)
+
                 self.rig_approved = False
                 self.btn_generate_frames.setEnabled(True)
 
@@ -1880,6 +1896,34 @@ class MainWindow(QMainWindow):
 
     def step_frame(self, delta: int):
         self.set_selected_frame(self.selected_index + delta)
+
+    def toggle_play(self, enabled: bool):
+        self.playing = bool(enabled)
+        if self.playing:
+            if len(self.frames) < 2:
+                self.playing = False
+                self.btn_play.blockSignals(True)
+                self.btn_play.setChecked(False)
+                self.btn_play.blockSignals(False)
+                self.log("Play: servono almeno 2 frame")
+                return
+            self.btn_play.setText("stop")
+            self.play_timer.start()
+        else:
+            self.btn_play.setText("play")
+            self.play_timer.stop()
+
+    def on_play_tick(self):
+        if not self.playing:
+            return
+        if len(self.frames) < 2:
+            self.play_timer.stop()
+            self.playing = False
+            self.btn_play.setChecked(False)
+            self.btn_play.setText("play")
+            return
+        next_idx = (self.selected_index + 1) % len(self.frames)
+        self.set_selected_frame(next_idx)
 
     def open_detail(self):
         fr = self.frames[self.selected_index]
