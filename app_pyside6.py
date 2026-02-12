@@ -1174,9 +1174,15 @@ class MainWindow(QMainWindow):
         self.topology_new_node_counter: int = 1
 
         self.detail_dialog = DetailDialog(self)
+        self.build_menu()
 
         self.build_ui()
         self.refresh_ui()
+
+    def build_menu(self):
+        menu = self.menuBar().addMenu("Progetto")
+        menu.addAction("Salva progetto", self.save_project)
+        menu.addAction("Importa progetto", self.load_project)
 
     def build_ui(self):
         root = QWidget()
@@ -1402,6 +1408,160 @@ class MainWindow(QMainWindow):
 
     def log(self, msg: str):
         self.log_box.append(msg)
+
+    def _frame_to_project_dict(self, fr: FrameData, idx: int) -> Dict:
+        return {
+            "index": idx,
+            "image": f"frames/{idx}_image.png" if fr.image is not None else None,
+            "generated": f"frames/{idx}_generated.png" if fr.generated is not None else None,
+            "image_offset": list(fr.image_offset),
+            "rig_nodes": {k: [float(x), float(y)] for k, (x, y) in (fr.rig_nodes or {}).items()},
+            "is_keyframe": bool(fr.is_keyframe),
+            "key_description": fr.key_description,
+            "caption": fr.caption,
+            "rig_profile": fr.rig_profile,
+            "detected_profile": fr.detected_profile,
+        }
+
+    def save_project(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salva progetto",
+            str(Path.cwd() / "progetto.animproj"),
+            "Animator Project (*.animproj)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".animproj"):
+            path += ".animproj"
+
+        project = {
+            "version": 1,
+            "prompt": self.prompt.toPlainText(),
+            "negative": self.negative.toPlainText(),
+            "caption_hint": self.caption_hint.toPlainText(),
+            "use_gemini_caption": bool(self.use_gemini_caption.isChecked()),
+            "gemini_model": self.gemini_model.text().strip(),
+            "frame_count": len(self.frames),
+            "selected_index": self.selected_index,
+            "onion_enabled": bool(self.chk_onion.isChecked()),
+            "onion_range": int(self.onion_range.value()),
+            "move_step": int(self.preview_move_step.value()),
+            "eyedropper_tol": int(self.eyedropper_tol.value()),
+            "last_eyedrop_color": list(self.last_eyedrop_color),
+            "show_raster": bool(self.chk_sprite.isChecked()),
+            "show_skeleton": bool(self.chk_pose.isChecked()),
+            "topology_bones": self.topology_bones or [],
+            "topology_new_node_counter": int(self.topology_new_node_counter),
+            "frames": [self._frame_to_project_dict(fr, i) for i, fr in enumerate(self.frames)],
+        }
+
+        try:
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("project.json", json.dumps(project, ensure_ascii=True, indent=2))
+                for i, fr in enumerate(self.frames):
+                    if fr.image is not None:
+                        buf = io.BytesIO()
+                        fr.image.save(buf, format="PNG")
+                        zf.writestr(f"frames/{i}_image.png", buf.getvalue())
+                    if fr.generated is not None:
+                        buf = io.BytesIO()
+                        fr.generated.save(buf, format="PNG")
+                        zf.writestr(f"frames/{i}_generated.png", buf.getvalue())
+            self.log(f"Progetto salvato: {path}")
+        except Exception as e:
+            self.log(f"Errore salvataggio progetto: {e}")
+            QMessageBox.warning(self, "Errore", f"Salvataggio fallito: {e}")
+
+    def load_project(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importa progetto",
+            str(Path.cwd()),
+            "Animator Project (*.animproj)",
+        )
+        if not path:
+            return
+
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                raw = zf.read("project.json")
+                project = json.loads(raw.decode("utf-8"))
+
+                frames_data = project.get("frames", [])
+                count = int(project.get("frame_count", len(frames_data) or 0))
+                count = max(2, count) if count else 8
+                self.frames = [FrameData() for _ in range(count)]
+
+                for fd in frames_data:
+                    idx = int(fd.get("index", -1))
+                    if idx < 0 or idx >= len(self.frames):
+                        continue
+                    fr = FrameData()
+                    img_path = fd.get("image")
+                    if img_path:
+                        with zf.open(img_path) as f:
+                            fr.image = Image.open(io.BytesIO(f.read())).convert("RGBA")
+                    gen_path = fd.get("generated")
+                    if gen_path:
+                        with zf.open(gen_path) as f:
+                            fr.generated = Image.open(io.BytesIO(f.read())).convert("RGBA")
+                    fr.image_offset = tuple(fd.get("image_offset", [0, 0]))
+                    rn = fd.get("rig_nodes") or {}
+                    if rn:
+                        fr.rig_nodes = {k: (float(v[0]), float(v[1])) for k, v in rn.items()}
+                    fr.is_keyframe = bool(fd.get("is_keyframe", False))
+                    fr.key_description = fd.get("key_description", "") or ""
+                    fr.caption = fd.get("caption", "") or ""
+                    fr.rig_profile = fd.get("rig_profile", "auto") or "auto"
+                    fr.detected_profile = fd.get("detected_profile", "human") or "human"
+                    self.frames[idx] = fr
+
+                self.prompt.setPlainText(project.get("prompt", "") or "")
+                self.negative.setPlainText(project.get("negative", "") or "")
+                self.caption_hint.setPlainText(project.get("caption_hint", "") or "")
+                self.use_gemini_caption.setChecked(bool(project.get("use_gemini_caption", True)))
+                self.gemini_model.setText(project.get("gemini_model", "gemini-2.5-flash"))
+
+                self.chk_onion.setChecked(bool(project.get("onion_enabled", False)))
+                self.onion_range.setValue(int(project.get("onion_range", 2)))
+                self.preview_move_step.setValue(int(project.get("move_step", 2)))
+                self.eyedropper_tol.setValue(int(project.get("eyedropper_tol", 10)))
+                col = project.get("last_eyedrop_color", [0, 0, 0])
+                if isinstance(col, list) and len(col) == 3:
+                    self.last_eyedrop_color = (int(col[0]), int(col[1]), int(col[2]))
+                self._update_eyedropper_chip()
+
+                self.chk_sprite.setChecked(bool(project.get("show_raster", True)))
+                self.chk_pose.setChecked(bool(project.get("show_skeleton", True)))
+
+                self.topology_bones = project.get("topology_bones") or None
+                self.topology_new_node_counter = int(project.get("topology_new_node_counter", 1))
+
+                # Recompute bone lengths for loaded frames.
+                for i, fr in enumerate(self.frames):
+                    if fr.rig_nodes is not None:
+                        bones = self.get_frame_bones(fr)
+                        fr.bone_lengths = compute_bone_lengths(fr.rig_nodes, bones)
+                        self.frames[i] = fr
+
+                self.selected_index = int(project.get("selected_index", 0))
+                self.selected_index = max(0, min(self.selected_index, len(self.frames) - 1))
+                self.frame_slider.blockSignals(True)
+                self.frame_slider.setValue(len(self.frames))
+                self.frame_slider.blockSignals(False)
+
+                self.rig_approved = False
+                self.btn_approve_rig.blockSignals(True)
+                self.btn_approve_rig.setChecked(False)
+                self.btn_approve_rig.blockSignals(False)
+                self.btn_generate_frames.setEnabled(False)
+
+                self.refresh_ui()
+                self.log(f"Progetto importato: {path}")
+        except Exception as e:
+            self.log(f"Errore importazione progetto: {e}")
+            QMessageBox.warning(self, "Errore", f"Importazione fallita: {e}")
 
     def refresh_ui(self):
         self.rebuild_thumbs()
