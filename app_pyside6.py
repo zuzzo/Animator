@@ -1422,12 +1422,21 @@ class MainWindow(QMainWindow):
             lab = QLabel(label_text)
             btn_minus = QPushButton("-")
             btn_plus = QPushButton("+")
+            btn_minus.setObjectName("spinbtn")
+            btn_plus.setObjectName("spinbtn")
             btn_minus.setFixedSize(22, 22)
             btn_plus.setFixedSize(22, 22)
+            btn_minus.setAutoRepeat(True)
+            btn_plus.setAutoRepeat(True)
             spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
             spin.setFixedWidth(48)
-            btn_minus.clicked.connect(lambda: spin.setValue(max(spin.minimum(), spin.value() - spin.singleStep())))
-            btn_plus.clicked.connect(lambda: spin.setValue(min(spin.maximum(), spin.value() + spin.singleStep())))
+            spin.setReadOnly(False)
+            btn_minus.clicked.connect(
+                lambda _=None, s=spin: s.setValue(max(s.minimum(), s.value() - s.singleStep()))
+            )
+            btn_plus.clicked.connect(
+                lambda _=None, s=spin: s.setValue(min(s.maximum(), s.value() + s.singleStep()))
+            )
             row.addWidget(lab)
             row.addWidget(btn_minus)
             row.addWidget(spin)
@@ -1497,6 +1506,7 @@ class MainWindow(QMainWindow):
             "QTextEdit:focus, QLineEdit:focus { border: 1px solid #2563eb; }"
             "QPushButton { background: #e2e8f0; color: #0f172a; border: 1px solid #94a3b8; padding: 6px 10px; }"
             "QPushButton:hover { background: #cbd5e1; }"
+            "QPushButton#spinbtn { padding: 0px; min-width: 22px; min-height: 22px; }"
             "QCheckBox { color: #0f172a; spacing: 6px; }"
             "QSpinBox, QDoubleSpinBox, QComboBox { background: #ffffff; color: #0f172a; border: 1px solid #94a3b8; }"
             "QLabel#title { font-size: 48px; font-weight: 700; color: #334155; }"
