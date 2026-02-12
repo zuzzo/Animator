@@ -1184,6 +1184,8 @@ class MainWindow(QMainWindow):
         menu = self.menuBar().addMenu("Progetto")
         menu.addAction("Salva progetto", self.save_project)
         menu.addAction("Importa progetto", self.load_project)
+        menu.addSeparator()
+        menu.addAction("Salva config", self.save_config)
 
     def build_ui(self):
         root = QWidget()
