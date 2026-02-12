@@ -621,12 +621,17 @@ def gemini_generate_rig_animation(
         f"Descrizioni keyframe (opzionale): {key_hint}\n"
         f"Keyframe nodes (vincoli, opzionale): {key_nodes_hint}\n"
         "Se i keyframe nodes sono forniti, i frame corrispondenti devono rispettare quei valori.\n"
+        "Rispondi SOLO con un oggetto JSON. Non usare blocchi di codice, non usare markdown.\n"
+        "Se non puoi rispondere, restituisci: {\"frames\": []}\n"
         "Rispondi SOLO con JSON valido, senza testo extra o markdown.\n"
         "Esempio formato:\n"
         f"{example}"
     )
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = {"contents": [{"parts": [{"text": instruction}]}]}
+    body = {
+        "contents": [{"parts": [{"text": instruction}]}],
+        "generationConfig": {"temperature": 0.2},
+    }
 
     last_err = None
     text = ""
@@ -652,24 +657,39 @@ def gemini_generate_rig_animation(
     if not text:
         raise RuntimeError("Gemini non ha restituito testo.")
     # Try to parse JSON; if model wrapped it, extract the first JSON object.
+    def _extract_json_block(raw: str) -> Optional[str]:
+        import re
+        if not raw:
+            return None
+        m = re.search(r"```json\\s*(\\{[\\s\\S]*?\\})\\s*```", raw)
+        if m:
+            return m.group(1)
+        m = re.search(r"\\{[\\s\\S]*\\}", raw)
+        if m:
+            return m.group(0)
+        return None
+
+    def _repair_json_text(raw: str) -> str:
+        # Basic repairs: replace fancy quotes, remove trailing commas.
+        import re
+        s = raw.replace("“", "\"").replace("”", "\"").replace("’", "'")
+        s = re.sub(r",\\s*([}\\]])", r"\\1", s)
+        return s
+
     try:
         data = json.loads(text)
     except Exception:
-        import re
-        # Try to extract JSON from code fences or any brace block.
-        m = re.search(r"```json\\s*(\\{[\\s\\S]*?\\})\\s*```", text)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-            except Exception as e:
-                raise RuntimeError(f"JSON non valido: {e}")
-        m = re.search(r"\\{[\\s\\S]*\\}", text)
-        if not m:
+        block = _extract_json_block(text)
+        if not block:
             raise RuntimeError("JSON non valido: nessun oggetto JSON trovato.")
         try:
-            data = json.loads(m.group(0))
-        except Exception as e:
-            raise RuntimeError(f"JSON non valido: {e}")
+            data = json.loads(block)
+        except Exception:
+            block = _repair_json_text(block)
+            try:
+                data = json.loads(block)
+            except Exception as e:
+                raise RuntimeError(f"JSON non valido: {e}")
     frames = data.get("frames")
     if not isinstance(frames, list) or len(frames) != frame_count:
         raise RuntimeError("Output JSON non valido: frames mancante o lunghezza errata.")
