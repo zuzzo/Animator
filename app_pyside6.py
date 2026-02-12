@@ -1177,6 +1177,7 @@ class MainWindow(QMainWindow):
         self.build_menu()
 
         self.build_ui()
+        self.load_config()
         self.refresh_ui()
 
     def build_menu(self):
@@ -1409,6 +1410,36 @@ class MainWindow(QMainWindow):
     def log(self, msg: str):
         self.log_box.append(msg)
 
+    def _config_path(self) -> Path:
+        return Path.home() / ".animator" / "config.json"
+
+    def load_config(self):
+        try:
+            cfg_path = self._config_path()
+            if not cfg_path.exists():
+                return
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            api_key = (data.get("gemini_api_key") or "").strip()
+            if api_key:
+                self.gemini_api_key.setText(api_key)
+            model = (data.get("gemini_model") or "").strip()
+            if model:
+                self.gemini_model.setText(model)
+        except Exception as e:
+            self.log(f"Errore lettura config: {e}")
+
+    def save_config(self):
+        try:
+            cfg_path = self._config_path()
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "gemini_api_key": self.gemini_api_key.text().strip(),
+                "gemini_model": self.gemini_model.text().strip(),
+            }
+            cfg_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.log(f"Errore salvataggio config: {e}")
+
     def _frame_to_project_dict(self, fr: FrameData, idx: int) -> Dict:
         return {
             "index": idx,
@@ -1432,6 +1463,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self.save_config()
         if not path.lower().endswith(".animproj"):
             path += ".animproj"
 
