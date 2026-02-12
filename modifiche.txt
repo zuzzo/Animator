@@ -1,0 +1,41 @@
+﻿RIEPILOGO MODIFICHE (ultime ~14 ore)
+
+1) Setup repository e dipendenze
+- Clonato il repository in C:\Giochi Python\Animator (la cartella iniziale era vuota, quindi clone al posto di pull).
+- Installate dipendenze con Python 3.13.
+- Aggiunta dipendenza mancante `requests` in requirements.txt, perche` app_pyside6.py la importa esplicitamente.
+
+2) Fix crash contagocce/chroma key
+- Corretto errore di broadcast in `apply_chroma_key`.
+- Prima: estrazione canali con `data.T` (assi invertiti -> shape non compatibili).
+- Dopo: canali estratti con `data[..., 0]`, `data[..., 1]`, `data[..., 2]`.
+- Risultato: niente piu` ValueError quando si usa il contagocce su immagini non quadrate.
+
+3) Evoluzione simulazione ossea locale (coerenza temporale + vincoli)
+- Potenziata la simulazione del rig per animare i frame non-keyframe in modo piu` coerente.
+- Introdotti parametri motion derivati dal prompt (ampiezza, bob, swing, cicli).
+- Migliorata la sintesi del movimento con vincoli ossei applicati a fine passaggio.
+
+4) Debug avanzato nel log UI
+- Aggiunti log dettagliati in `log_box` per il flusso "gemini-motion".
+- Loggati: presenza API key, modello, keyframe/anchor, prompt, stato chiamata, fallback.
+
+5) Integrazione reale Gemini per il motion-plan osseo
+- Implementata chiamata API Gemini per ottenere un piano di movimento in JSON.
+- Aggiunto parsing robusto della risposta (gestione JSON anche se avvolto in markdown).
+- Validazione schema e clipping offset.
+- Fusione del piano Gemini con il motion locale, mantenendo fallback automatico al solver locale se la risposta non e` valida.
+
+6) Associazione segmento osseo <-> corrispettivo anatomico sul raster
+- Aggiunto campo `bone_correspondence` nel frame.
+- Implementata analisi di corrispondenza per segmenti ossei incrociando:
+  - geometria dei segmenti (posizione, lunghezza, orientamento)
+  - coverage sul raster (maschera soggetto)
+- La mappa risultante viene passata a Gemini nel payload come `bone_to_anatomy_map`.
+
+7) Riduzione warning rumorosi all'avvio
+- Silenziati warning noti di terze parti relativi a tiny_vit registry overwrite, non bloccanti per il funzionamento.
+
+Stato file modificati
+- app_pyside6.py: modifiche estese (motion, debug, Gemini plan, bone mapping, fix chroma key, filtri warning)
+- requirements.txt: aggiunta riga `requests`
