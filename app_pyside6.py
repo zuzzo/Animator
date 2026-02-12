@@ -844,18 +844,30 @@ class VectorPreviewWidget(QWidget):
 
         if self.parent_win.chk_onion.isChecked():
             r = self.parent_win.onion_range.value()
-            for k in range(max(0, self.parent_win.selected_index - r), min(len(self.parent_win.frames), self.parent_win.selected_index + r + 1)):
-                if k == self.parent_win.selected_index:
-                    continue
-                other = self.parent_win.frames[k].generated or self.parent_win.frames[k].image
-                if other is None:
-                    continue
-                if self.parent_win.frames[k].generated is None:
-                    other = compose_with_offset(other, self.parent_win.frames[k].image_offset)
-                ov = other.convert("RGBA").copy()
-                ov.putalpha(60)
-                if ov.size == base.size:
-                    base = Image.alpha_composite(base, ov)
+            if r > 0:
+                onion = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                cur = self.parent_win.selected_index
+                lo = max(0, cur - r)
+                hi = min(len(self.parent_win.frames), cur + r + 1)
+                for k in range(lo, hi):
+                    if k == cur:
+                        continue
+                    d = abs(k - cur)
+                    other = self.parent_win.frames[k].generated or self.parent_win.frames[k].image
+                    if other is None:
+                        continue
+                    if self.parent_win.frames[k].generated is None:
+                        other = compose_with_offset(other, self.parent_win.frames[k].image_offset)
+                    ov = other.convert("RGBA")
+                    if ov.size != base.size:
+                        ov = ov.resize(base.size, Image.NEAREST)
+                    max_alpha = 140
+                    min_alpha = 25
+                    fall = (r - d + 1) / max(1, r)
+                    alpha = int(min_alpha + (max_alpha - min_alpha) * max(0.0, min(1.0, fall)))
+                    ov.putalpha(alpha)
+                    onion = Image.alpha_composite(onion, ov)
+                base = Image.alpha_composite(onion, base)
         return base
 
     def _fit_rect(self, img_w: int, img_h: int) -> QRect:
@@ -966,6 +978,62 @@ class VectorPreviewWidget(QWidget):
 
         fr = self.parent_win.frames[self.parent_win.selected_index]
         if self.parent_win.chk_pose.isChecked() and fr.rig_nodes is not None:
+            # Onion skin for rig (semi-transparent previous/next frames).
+            if self.parent_win.chk_onion.isChecked():
+                r = self.parent_win.onion_range.value()
+                if r > 0:
+                    cur = self.parent_win.selected_index
+                    lo = max(0, cur - r)
+                    hi = min(len(self.parent_win.frames), cur + r + 1)
+                    for k in range(lo, hi):
+                        if k == cur:
+                            continue
+                        other = self.parent_win.frames[k]
+                        if other.rig_nodes is None:
+                            continue
+                        d = abs(k - cur)
+                        max_alpha = 140
+                        min_alpha = 25
+                        fall = (r - d + 1) / max(1, r)
+                        alpha = int(min_alpha + (max_alpha - min_alpha) * max(0.0, min(1.0, fall)))
+                        bones = self._frame_bones(other)
+                        used_nodes = set()
+                        for a, b in bones:
+                            if a not in other.rig_nodes or b not in other.rig_nodes:
+                                continue
+                            used_nodes.add(a)
+                            used_nodes.add(b)
+                            ax, ay = other.rig_nodes[a]
+                            bx, by = other.rig_nodes[b]
+                            awx, awy = self._image_to_widget(ax, ay, rect, img.size)
+                            bwx, bwy = self._image_to_widget(bx, by, rect, img.size)
+                            if a.startswith("l_") or b.startswith("l_"):
+                                c = QColor(*RIG_COLORS["left"])
+                            elif a.startswith("r_") or b.startswith("r_"):
+                                c = QColor(*RIG_COLORS["right"])
+                            else:
+                                c = QColor(*RIG_COLORS["center"])
+                            c.setAlpha(alpha)
+                            painter.setPen(QPen(c, 2))
+                            painter.drawLine(awx, awy, bwx, bwy)
+                        for n, (x, y) in other.rig_nodes.items():
+                            if n not in used_nodes:
+                                continue
+                            wx, wy = self._image_to_widget(x, y, rect, img.size)
+                            if n.startswith("l_"):
+                                c = QColor(*RIG_COLORS["left"])
+                            elif n.startswith("r_"):
+                                c = QColor(*RIG_COLORS["right"])
+                            else:
+                                c = QColor(*RIG_COLORS["center"])
+                            c.setAlpha(alpha)
+                            painter.setPen(QPen(QColor(255, 255, 255, alpha), 0))
+                            painter.setBrush(QBrush(QColor(255, 255, 255, alpha)))
+                            painter.drawEllipse(wx - 6, wy - 6, 12, 12)
+                            painter.setPen(QPen(QColor(15, 23, 42, alpha), 1))
+                            painter.setBrush(QBrush(c))
+                            painter.drawEllipse(wx - 4, wy - 4, 8, 8)
+
             bones = self._frame_bones(fr)
             used_nodes = set()
             for a, b in bones:
