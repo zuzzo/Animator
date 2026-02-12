@@ -588,11 +588,18 @@ def gemini_generate_rig_animation(
     frame_count: int,
     prompt: str,
     key_descriptions: Dict[int, str],
+    key_nodes: Optional[Dict[int, Dict[str, Tuple[float, float]]]] = None,
 ) -> List[Dict[str, Tuple[float, float]]]:
     # Ask Gemini for normalized coordinates per frame (0..1)
     node_list = list(base_nodes.keys())
     skeleton_hint = "; ".join([f"{a}-{b}" for a, b in bones])
     key_hint = ", ".join([f"{k+1}:{v}" for k, v in key_descriptions.items() if v])
+    key_nodes_hint = ""
+    if key_nodes:
+        try:
+            key_nodes_hint = json.dumps(key_nodes, ensure_ascii=True)
+        except Exception:
+            key_nodes_hint = ""
     example = (
         '{\n'
         '  "frames": [\n'
@@ -612,6 +619,8 @@ def gemini_generate_rig_animation(
         f"Segmenti: {skeleton_hint}\n"
         f"Prompt animazione: {prompt}\n"
         f"Descrizioni keyframe (opzionale): {key_hint}\n"
+        f"Keyframe nodes (vincoli, opzionale): {key_nodes_hint}\n"
+        "Se i keyframe nodes sono forniti, i frame corrispondenti devono rispettare quei valori.\n"
         "Rispondi SOLO con JSON valido, senza testo extra o markdown.\n"
         "Esempio formato:\n"
         f"{example}"
@@ -2102,6 +2111,19 @@ class MainWindow(QMainWindow):
             return
         bones = self.get_frame_bones(fr0)
         key_descs = {i: fr.key_description for i, fr in enumerate(self.frames) if fr.is_keyframe and fr.key_description}
+        key_nodes = {}
+        for i, fr in enumerate(self.frames):
+            if not fr.is_keyframe or fr.rig_nodes is None:
+                continue
+            if fr.image is None:
+                continue
+            w_i, h_i = fr.image.size
+            norm = {}
+            for n, (x, y) in fr.rig_nodes.items():
+                nx = 0.0 if w_i <= 1 else max(0.0, min(1.0, x / (w_i - 1)))
+                ny = 0.0 if h_i <= 1 else max(0.0, min(1.0, y / (h_i - 1)))
+                norm[n] = (nx, ny)
+            key_nodes[i] = norm
         self.log("[AI rig] Richiesta inviata a Gemini")
         try:
             frames_norm = gemini_generate_rig_animation(
@@ -2112,6 +2134,7 @@ class MainWindow(QMainWindow):
                 len(self.frames),
                 self.prompt.toPlainText().strip(),
                 key_descs,
+                key_nodes,
             )
         except Exception as e:
             self.log(f"[AI rig] Errore: {e}")
