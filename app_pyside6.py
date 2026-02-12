@@ -1253,16 +1253,12 @@ class MainWindow(QMainWindow):
         self.btn_generate_pose.clicked.connect(self.simulate_rig_animation)
         self.btn_ai_rig = QPushButton("AI rig")
         self.btn_ai_rig.clicked.connect(self.generate_rig_with_ai)
-        self.btn_approve_rig = QPushButton("approva rig")
-        self.btn_approve_rig.setCheckable(True)
-        self.btn_approve_rig.toggled.connect(self.set_rig_approved)
         self.btn_generate_frames = QPushButton("genera raster")
         self.btn_generate_frames.clicked.connect(self.generate_final_frames)
-        self.btn_generate_frames.setEnabled(False)
+        self.btn_generate_frames.setEnabled(True)
 
         left_layout.addWidget(self.btn_generate_pose)
         left_layout.addWidget(self.btn_ai_rig)
-        left_layout.addWidget(self.btn_approve_rig)
         left_layout.addWidget(self.btn_generate_frames)
 
         self.log_box = QTextEdit()
@@ -1586,10 +1582,7 @@ class MainWindow(QMainWindow):
                 self.frame_slider.blockSignals(False)
 
                 self.rig_approved = False
-                self.btn_approve_rig.blockSignals(True)
-                self.btn_approve_rig.setChecked(False)
-                self.btn_approve_rig.blockSignals(False)
-                self.btn_generate_frames.setEnabled(False)
+                self.btn_generate_frames.setEnabled(True)
 
                 self.refresh_ui()
                 self.log(f"Progetto importato: {path}")
@@ -1602,24 +1595,10 @@ class MainWindow(QMainWindow):
         self.refresh_preview()
         self.update_frame_label()
         self.sync_keyframe_editor()
-        self.btn_generate_frames.setEnabled(self.rig_approved)
-        self.btn_approve_rig.blockSignals(True)
-        self.btn_approve_rig.setChecked(self.rig_approved)
-        self.btn_approve_rig.blockSignals(False)
+        self.btn_generate_frames.setEnabled(True)
 
     def mark_rig_dirty(self):
-        if self.rig_approved:
-            self.rig_approved = False
-            self.btn_generate_frames.setEnabled(False)
-            self.btn_approve_rig.blockSignals(True)
-            self.btn_approve_rig.setChecked(False)
-            self.btn_approve_rig.blockSignals(False)
-            self.log("Rig modificato: approvazione rimossa")
-
-    def set_rig_approved(self, approved: bool):
-        self.rig_approved = bool(approved)
-        self.btn_generate_frames.setEnabled(self.rig_approved)
-        self.log("Rig approvato: puoi generare raster" if self.rig_approved else "Rig non approvato")
+        return
 
     def toggle_eyedropper_mode(self, enabled: bool):
         self.eyedropper_mode = bool(enabled)
@@ -2373,9 +2352,6 @@ class MainWindow(QMainWindow):
         self.log("[AI rig] Animazione rig generata")
 
     def generate_final_frames(self):
-        if not self.rig_approved:
-            QMessageBox.warning(self, "Attenzione", "Approva prima il rig (pulsante 'approva rig').")
-            return
         idx0 = next((i for i, fr in enumerate(self.frames) if fr.image is not None), None)
         if idx0 is None:
             QMessageBox.warning(self, "Attenzione", "Carica almeno un frame con sprite")
