@@ -2034,53 +2034,55 @@ class MainWindow(QMainWindow):
 
         amp, bob, swing = self._motion_params_from_prompt()
         for i in range(len(self.frames)):
-            if self.frames[i].rig_nodes is None:
-                prev = max([k for k in key_idxs if k < i], default=None)
-                nxt = min([k for k in key_idxs if k > i], default=None)
-                if prev is not None and nxt is not None:
-                    t = (i - prev) / (nxt - prev)
-                    nodes = {}
-                    common = set(self.frames[prev].rig_nodes.keys()) & set(self.frames[nxt].rig_nodes.keys())
-                    for n in common:
-                        px, py = self.frames[prev].rig_nodes[n]
-                        nx, ny = self.frames[nxt].rig_nodes[n]
-                        nodes[n] = (px + (nx - px) * t, py + (ny - py) * t)
-                    if not nodes:
-                        nodes = dict(self.frames[prev].rig_nodes)
-                    # Add mild procedural motion from prompt for non-key segments.
-                    src_img = self.frames[prev].image or self.frames[nxt].image
-                    if src_img is not None:
-                        ph = (i / max(1, len(self.frames) - 1)) * 2.0 * math.pi
-                        dx = math.sin(ph) * src_img.width * amp
-                        dy = math.sin(ph + math.pi / 2) * src_img.height * bob
-                        for n in list(nodes.keys()):
-                            x, y = nodes[n]
-                            if n.endswith("hand") or n.endswith("foot"):
-                                nodes[n] = (x + dx * swing, y + dy)
-                    self.frames[i].rig_nodes = nodes
-                    self.frames[i].detected_profile = self.frames[prev].detected_profile
-                else:
-                    src = self.frames[prev if prev is not None else nxt]
-                    nodes = dict(src.rig_nodes)
-                    # Single-keyframe case: synthesize motion over timeline.
-                    src_img = src.image or self.frames[0].image
-                    if src_img is not None:
-                        ph = (i / max(1, len(self.frames) - 1)) * 2.0 * math.pi
-                        dx = math.sin(ph) * src_img.width * amp
-                        dy = math.sin(ph + math.pi / 2) * src_img.height * bob
-                        for n in list(nodes.keys()):
-                            x, y = nodes[n]
-                            if n.endswith("hand") or n.endswith("foot"):
-                                nodes[n] = (x + dx * (1.0 + swing), y + dy)
-                            elif n in ("hip", "spine", "neck", "center"):
-                                nodes[n] = (x + dx * 0.35, y + dy * 0.35)
-                    self.frames[i].rig_nodes = nodes
-                    self.frames[i].detected_profile = src.detected_profile
-                bones = self.get_frame_bones(self.frames[i])
-                self.frames[i].bone_lengths = compute_bone_lengths(self.frames[i].rig_nodes, bones)
+            fr = self.frames[i]
+            if fr.is_keyframe:
+                if fr.rig_nodes is not None:
+                    bones = self.get_frame_bones(fr)
+                    fr.bone_lengths = compute_bone_lengths(fr.rig_nodes, bones)
+                continue
+            prev = max([k for k in key_idxs if k < i], default=None)
+            nxt = min([k for k in key_idxs if k > i], default=None)
+            if prev is not None and nxt is not None:
+                t = (i - prev) / (nxt - prev)
+                nodes = {}
+                common = set(self.frames[prev].rig_nodes.keys()) & set(self.frames[nxt].rig_nodes.keys())
+                for n in common:
+                    px, py = self.frames[prev].rig_nodes[n]
+                    nx, ny = self.frames[nxt].rig_nodes[n]
+                    nodes[n] = (px + (nx - px) * t, py + (ny - py) * t)
+                if not nodes:
+                    nodes = dict(self.frames[prev].rig_nodes)
+                # Add mild procedural motion from prompt for non-key segments.
+                src_img = self.frames[prev].image or self.frames[nxt].image
+                if src_img is not None:
+                    ph = (i / max(1, len(self.frames) - 1)) * 2.0 * math.pi
+                    dx = math.sin(ph) * src_img.width * amp
+                    dy = math.sin(ph + math.pi / 2) * src_img.height * bob
+                    for n in list(nodes.keys()):
+                        x, y = nodes[n]
+                        if n.endswith("hand") or n.endswith("foot"):
+                            nodes[n] = (x + dx * swing, y + dy)
+                fr.rig_nodes = nodes
+                fr.detected_profile = self.frames[prev].detected_profile
             else:
-                bones = self.get_frame_bones(self.frames[i])
-                self.frames[i].bone_lengths = compute_bone_lengths(self.frames[i].rig_nodes, bones)
+                src = self.frames[prev if prev is not None else nxt]
+                nodes = dict(src.rig_nodes)
+                # Single-keyframe case: synthesize motion over timeline.
+                src_img = src.image or self.frames[0].image
+                if src_img is not None:
+                    ph = (i / max(1, len(self.frames) - 1)) * 2.0 * math.pi
+                    dx = math.sin(ph) * src_img.width * amp
+                    dy = math.sin(ph + math.pi / 2) * src_img.height * bob
+                    for n in list(nodes.keys()):
+                        x, y = nodes[n]
+                        if n.endswith("hand") or n.endswith("foot"):
+                            nodes[n] = (x + dx * (1.0 + swing), y + dy)
+                        elif n in ("hip", "spine", "neck", "center"):
+                            nodes[n] = (x + dx * 0.35, y + dy * 0.35)
+                fr.rig_nodes = nodes
+                fr.detected_profile = src.detected_profile
+            bones = self.get_frame_bones(fr)
+            fr.bone_lengths = compute_bone_lengths(fr.rig_nodes, bones)
         self.mark_rig_dirty()
         self.refresh_ui()
         self.log("Simulazione rig completata (keyframe + prompt)")
@@ -2125,6 +2127,8 @@ class MainWindow(QMainWindow):
                 x = max(0.0, min(1.0, nx)) * (w - 1)
                 y = max(0.0, min(1.0, ny)) * (h - 1)
                 abs_nodes[n] = (x, y)
+            if self.frames[i].is_keyframe and self.frames[i].rig_nodes is not None:
+                continue
             self.frames[i].rig_nodes = abs_nodes
             self.frames[i].bone_lengths = compute_bone_lengths(abs_nodes, self.get_frame_bones(self.frames[i]))
         self.mark_rig_dirty()
