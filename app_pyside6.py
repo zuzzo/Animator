@@ -18,6 +18,7 @@ from PySide6.QtCore import QMimeData, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QDrag, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -1400,14 +1401,10 @@ class MainWindow(QMainWindow):
         self.onion_range.valueChanged.connect(self.refresh_preview)
         self.onion_range.setRange(1, 10)
         self.onion_range.setValue(2)
-        self.onion_range.setButtonSymbols(QSpinBox.PlusMinus)
-        self.onion_range.setFixedWidth(64)
         self.onion_range.setToolTip("Numero di frame prima/dopo da mostrare")
         self.preview_move_step = QSpinBox()
         self.preview_move_step.setRange(1, 64)
         self.preview_move_step.setValue(2)
-        self.preview_move_step.setButtonSymbols(QSpinBox.PlusMinus)
-        self.preview_move_step.setFixedWidth(64)
         self.preview_move_step.setToolTip("Passo spostamento frecce (px)")
         self.eyedropper_tol = QSpinBox()
         self.eyedropper_tol.setRange(0, 80)
@@ -1418,11 +1415,28 @@ class MainWindow(QMainWindow):
         self.eyedropper_color_chip.setFixedSize(22, 22)
         self.eyedropper_color_chip.setToolTip("Ultimo colore selezionato")
         self._update_eyedropper_chip()
+        def _spin_group(label_text: str, spin: QSpinBox) -> QWidget:
+            wrap = QWidget()
+            row = QHBoxLayout(wrap)
+            row.setContentsMargins(0, 0, 0, 0)
+            lab = QLabel(label_text)
+            btn_minus = QPushButton("-")
+            btn_plus = QPushButton("+")
+            btn_minus.setFixedSize(22, 22)
+            btn_plus.setFixedSize(22, 22)
+            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            spin.setFixedWidth(48)
+            btn_minus.clicked.connect(lambda: spin.setValue(max(spin.minimum(), spin.value() - spin.singleStep())))
+            btn_plus.clicked.connect(lambda: spin.setValue(min(spin.maximum(), spin.value() + spin.singleStep())))
+            row.addWidget(lab)
+            row.addWidget(btn_minus)
+            row.addWidget(spin)
+            row.addWidget(btn_plus)
+            return wrap
+
         right_bottom.addWidget(self.chk_onion)
-        right_bottom.addWidget(QLabel("range"))
-        right_bottom.addWidget(self.onion_range)
-        right_bottom.addWidget(QLabel("spostamento"))
-        right_bottom.addWidget(self.preview_move_step)
+        right_bottom.addWidget(_spin_group("range", self.onion_range))
+        right_bottom.addWidget(_spin_group("spostamento", self.preview_move_step))
         right_bottom.addWidget(QLabel("tol"))
         right_bottom.addWidget(self.eyedropper_tol)
         right_bottom.addWidget(QLabel("col"))
