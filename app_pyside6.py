@@ -139,7 +139,170 @@ RIG_COLORS = {
     "left": (34, 197, 94),
     "right": (59, 130, 246),
     "center": (249, 115, 22),
+    "alt_1": (239, 68, 68),
+    "alt_2": (168, 85, 247),
+    "alt_3": (14, 165, 233),
+    "alt_4": (234, 179, 8),
+    "alt_5": (236, 72, 153),
+    "alt_6": (20, 184, 166),
 }
+SEGMENT_COLOR_ORDER = [
+    "left",
+    "right",
+    "center",
+    "alt_1",
+    "alt_2",
+    "alt_3",
+    "alt_4",
+    "alt_5",
+    "alt_6",
+]
+
+
+def canonical_bone(a: str, b: str) -> Tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def preferred_bone_color(a: str, b: str) -> str:
+    if a.startswith("l_") or b.startswith("l_"):
+        return "left"
+    if a.startswith("r_") or b.startswith("r_"):
+        return "right"
+    return "center"
+
+
+def distribute_bone_colors(
+    bones: List[Tuple[str, str]],
+    max_per_color_per_node: int = 2,
+) -> Dict[Tuple[str, str], str]:
+    unique_edges: List[Tuple[str, str]] = []
+    edge_to_nodes: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    edge_pref: Dict[Tuple[str, str], str] = {}
+    adjacency: Dict[str, List[Tuple[str, str]]] = {}
+    for a, b in bones:
+        key = canonical_bone(a, b)
+        if key not in edge_to_nodes:
+            unique_edges.append(key)
+            edge_to_nodes[key] = (a, b)
+            edge_pref[key] = preferred_bone_color(a, b)
+            adjacency.setdefault(a, []).append(key)
+            adjacency.setdefault(b, []).append(key)
+
+    colors = tuple([c for c in SEGMENT_COLOR_ORDER if c in RIG_COLORS] or list(RIG_COLORS.keys()))
+
+    # Merge edges connected through degree-2 nodes: each resulting chain gets one color.
+    edge_idx = {e: i for i, e in enumerate(unique_edges)}
+    parent = list(range(len(unique_edges)))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a_idx: int, b_idx: int):
+        ra, rb = _find(a_idx), _find(b_idx)
+        if ra != rb:
+            parent[rb] = ra
+
+    for _node, inc in adjacency.items():
+        if len(inc) == 2:
+            _union(edge_idx[inc[0]], edge_idx[inc[1]])
+
+    groups: Dict[int, List[Tuple[str, str]]] = {}
+    for e in unique_edges:
+        r = _find(edge_idx[e])
+        groups.setdefault(r, []).append(e)
+
+    # Preferred color per chain: majority preference across its segments.
+    group_pref: Dict[int, str] = {}
+    for gid, edges in groups.items():
+        score = {c: 0 for c in colors}
+        for e in edges:
+            p = edge_pref[e]
+            if p in score:
+                score[p] += 1
+        group_pref[gid] = max(colors, key=lambda c: score[c])
+
+    # Node-color load counts segments, not groups.
+    counts: Dict[str, Dict[str, int]] = {n: {c: 0 for c in colors} for n in adjacency.keys()}
+    group_node_load: Dict[int, Dict[str, int]] = {}
+    for gid, edges in groups.items():
+        load: Dict[str, int] = {}
+        for e in edges:
+            a, b = edge_to_nodes[e]
+            load[a] = load.get(a, 0) + 1
+            load[b] = load.get(b, 0) + 1
+        group_node_load[gid] = load
+
+    # Hardness: prioritize groups touching higher-degree nodes and with more segments.
+    order = sorted(
+        groups.keys(),
+        key=lambda gid: (
+            max((len(adjacency.get(n, [])) for n in group_node_load[gid].keys()), default=0),
+            len(groups[gid]),
+        ),
+        reverse=True,
+    )
+    group_color: Dict[int, str] = {}
+
+    def _fits(gid: int, c: str) -> bool:
+        for n, load in group_node_load[gid].items():
+            if counts[n][c] + load > max_per_color_per_node:
+                return False
+        return True
+
+    def _apply(gid: int, c: str, sign: int):
+        for n, load in group_node_load[gid].items():
+            counts[n][c] += sign * load
+
+    def _try_assign(idx: int) -> bool:
+        if idx >= len(order):
+            return True
+        gid = order[idx]
+        pref = group_pref[gid]
+        options = [pref] + [c for c in colors if c != pref]
+        options.sort(
+            key=lambda c: sum(counts[n][c] for n in group_node_load[gid].keys())
+        )
+        for c in options:
+            if not _fits(gid, c):
+                continue
+            group_color[gid] = c
+            _apply(gid, c, +1)
+            if _try_assign(idx + 1):
+                return True
+            _apply(gid, c, -1)
+            del group_color[gid]
+        return False
+
+    if not _try_assign(0):
+        # Fallback for impossible topologies: minimize overload while preserving chains.
+        group_color.clear()
+        counts = {n: {c: 0 for c in colors} for n in adjacency.keys()}
+        for gid in order:
+            pref = group_pref[gid]
+            options = [pref] + [c for c in colors if c != pref]
+            best_c = min(
+                options,
+                key=lambda c: (
+                    sum(
+                        max(0, counts[n][c] + group_node_load[gid][n] - max_per_color_per_node)
+                        for n in group_node_load[gid].keys()
+                    ),
+                    sum(counts[n][c] for n in group_node_load[gid].keys()),
+                ),
+            )
+            group_color[gid] = best_c
+            _apply(gid, best_c, +1)
+
+    result: Dict[Tuple[str, str], str] = {}
+    for gid, edges in groups.items():
+        c = group_color.get(gid, group_pref[gid])
+        for e in edges:
+            result[e] = c
+    return result
+
 
 SDXL_BASE_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
 SDXL_CONTROLNET_OPENPOSE_ID = "xinsir/controlnet-openpose-sdxl-1.0"
@@ -568,22 +731,23 @@ def apply_rig_constraints(
     return work
 
 
-def rig_to_pose_map(nodes: Dict[str, Tuple[float, float]], size: Tuple[int, int], bones: List[Tuple[str, str]]) -> Image.Image:
+def rig_to_pose_map(
+    nodes: Dict[str, Tuple[float, float]],
+    size: Tuple[int, int],
+    bones: List[Tuple[str, str]],
+) -> Image.Image:
     w, h = size
     pose = Image.new("RGB", (w, h), (0, 0, 0))
     draw = ImageDraw.Draw(pose)
     lw = max(2, int(min(w, h) * 0.012))
+    bone_colors = distribute_bone_colors(bones, max_per_color_per_node=2)
     for a, b in bones:
         if a not in nodes or b not in nodes:
             continue
         ax, ay = nodes[a]
         bx, by = nodes[b]
-        if a.startswith("l_") or b.startswith("l_"):
-            c = RIG_COLORS["left"]
-        elif a.startswith("r_") or b.startswith("r_"):
-            c = RIG_COLORS["right"]
-        else:
-            c = RIG_COLORS["center"]
+        color_key = bone_colors.get(canonical_bone(a, b), preferred_bone_color(a, b))
+        c = RIG_COLORS[color_key]
         draw.line([(ax, ay), (bx, by)], fill=c, width=lw)
     for n, (x, y) in nodes.items():
         if n.startswith("l_"):
@@ -1266,16 +1430,19 @@ class VectorPreviewWidget(QWidget):
             else:
                 base = Image.new("RGBA", src.size, (0, 0, 0, 0))
 
-        if self.parent_win.chk_onion.isChecked():
+        if self.parent_win.chk_onion_prev.isChecked() or self.parent_win.chk_onion_next.isChecked():
             r = self.parent_win.onion_range.value()
             if r > 0:
                 onion = Image.new("RGBA", base.size, (0, 0, 0, 0))
                 cur = self.parent_win.selected_index
-                lo = max(0, cur - r)
-                hi = min(len(self.parent_win.frames), cur + r + 1)
-                for k in range(lo, hi):
-                    if k == cur:
-                        continue
+                indices: List[int] = []
+                if self.parent_win.chk_onion_prev.isChecked():
+                    lo = max(0, cur - r)
+                    indices.extend(range(lo, cur))
+                if self.parent_win.chk_onion_next.isChecked():
+                    hi = min(len(self.parent_win.frames), cur + r + 1)
+                    indices.extend(range(cur + 1, hi))
+                for k in indices:
                     d = abs(k - cur)
                     other = self.parent_win.frames[k].generated or self.parent_win.frames[k].image
                     if other is None:
@@ -1295,13 +1462,18 @@ class VectorPreviewWidget(QWidget):
         return base
 
     def _fit_rect(self, img_w: int, img_h: int) -> QRect:
-        w = max(1, self.width() - 20)
-        h = max(1, self.height() - 20)
+        # Reserve outer gutters so coordinate labels stay outside the image area.
+        left_gutter = 70
+        top_gutter = 28
+        right_gutter = 12
+        bottom_gutter = 12
+        w = max(1, self.width() - (left_gutter + right_gutter))
+        h = max(1, self.height() - (top_gutter + bottom_gutter))
         s = min(w / img_w, h / img_h)
         rw = int(img_w * s)
         rh = int(img_h * s)
-        x = (self.width() - rw) // 2
-        y = (self.height() - rh) // 2
+        x = left_gutter + (w - rw) // 2
+        y = top_gutter + (h - rh) // 2
         return QRect(x, y, rw, rh)
 
     def _widget_to_image(self, p: QPoint, rect: QRect, img_size: Tuple[int, int]) -> Tuple[float, float]:
@@ -1399,19 +1571,26 @@ class VectorPreviewWidget(QWidget):
         self._img_rect = rect
         pix = pil_to_qpixmap(img)
         painter.drawPixmap(rect, pix)
+        # Show frame dimensions on top/left edges of the rendered image.
+        painter.setPen(QPen(QColor("#0f172a")))
+        painter.drawText(rect.left(), rect.top() - 8, f"X: {img.width}px")
+        painter.drawText(8, rect.center().y(), f"Y: {img.height}px")
 
         fr = self.parent_win.frames[self.parent_win.selected_index]
         if self.parent_win.chk_pose.isChecked() and fr.rig_nodes is not None:
             # Onion skin for rig (semi-transparent previous/next frames).
-            if self.parent_win.chk_onion.isChecked():
+            if self.parent_win.chk_onion_prev.isChecked() or self.parent_win.chk_onion_next.isChecked():
                 r = self.parent_win.onion_range.value()
                 if r > 0:
                     cur = self.parent_win.selected_index
-                    lo = max(0, cur - r)
-                    hi = min(len(self.parent_win.frames), cur + r + 1)
-                    for k in range(lo, hi):
-                        if k == cur:
-                            continue
+                    indices: List[int] = []
+                    if self.parent_win.chk_onion_prev.isChecked():
+                        lo = max(0, cur - r)
+                        indices.extend(range(lo, cur))
+                    if self.parent_win.chk_onion_next.isChecked():
+                        hi = min(len(self.parent_win.frames), cur + r + 1)
+                        indices.extend(range(cur + 1, hi))
+                    for k in indices:
                         other = self.parent_win.frames[k]
                         if other.rig_nodes is None:
                             continue
@@ -1421,6 +1600,7 @@ class VectorPreviewWidget(QWidget):
                         fall = (r - d + 1) / max(1, r)
                         alpha = int(min_alpha + (max_alpha - min_alpha) * max(0.0, min(1.0, fall)))
                         bones = self._frame_bones(other)
+                        bone_colors = distribute_bone_colors(bones, max_per_color_per_node=2)
                         used_nodes = set()
                         for a, b in bones:
                             if a not in other.rig_nodes or b not in other.rig_nodes:
@@ -1431,12 +1611,8 @@ class VectorPreviewWidget(QWidget):
                             bx, by = other.rig_nodes[b]
                             awx, awy = self._image_to_widget(ax, ay, rect, img.size)
                             bwx, bwy = self._image_to_widget(bx, by, rect, img.size)
-                            if a.startswith("l_") or b.startswith("l_"):
-                                c = QColor(*RIG_COLORS["left"])
-                            elif a.startswith("r_") or b.startswith("r_"):
-                                c = QColor(*RIG_COLORS["right"])
-                            else:
-                                c = QColor(*RIG_COLORS["center"])
+                            color_key = bone_colors.get(canonical_bone(a, b), preferred_bone_color(a, b))
+                            c = QColor(*RIG_COLORS[color_key])
                             c.setAlpha(alpha)
                             painter.setPen(QPen(c, 2))
                             painter.drawLine(awx, awy, bwx, bwy)
@@ -1459,6 +1635,7 @@ class VectorPreviewWidget(QWidget):
                             painter.drawEllipse(wx - 4, wy - 4, 8, 8)
 
             bones = self._frame_bones(fr)
+            bone_colors = distribute_bone_colors(bones, max_per_color_per_node=2)
             corr_map: Dict[Tuple[str, str], str] = {}
             show_map = hasattr(self.parent_win, "chk_bone_map") and self.parent_win.chk_bone_map.isChecked()
             if show_map:
@@ -1475,12 +1652,8 @@ class VectorPreviewWidget(QWidget):
                 bx, by = fr.rig_nodes[b]
                 awx, awy = self._image_to_widget(ax, ay, rect, img.size)
                 bwx, bwy = self._image_to_widget(bx, by, rect, img.size)
-                if a.startswith("l_") or b.startswith("l_"):
-                    c = QColor(*RIG_COLORS["left"])
-                elif a.startswith("r_") or b.startswith("r_"):
-                    c = QColor(*RIG_COLORS["right"])
-                else:
-                    c = QColor(*RIG_COLORS["center"])
+                color_key = bone_colors.get(canonical_bone(a, b), preferred_bone_color(a, b))
+                c = QColor(*RIG_COLORS[color_key])
                 painter.setPen(QPen(c, 3))
                 painter.drawLine(awx, awy, bwx, bwy)
                 if show_map:
@@ -1860,13 +2033,15 @@ class MainWindow(QMainWindow):
         preview_grid.addWidget(self.btn_move_down, 2, 1, alignment=Qt.AlignCenter)
 
         right_bottom = QHBoxLayout()
-        self.chk_onion = QCheckBox("onion skin")
-        self.chk_onion.toggled.connect(self.refresh_preview)
+        self.chk_onion_prev = QCheckBox("onion precedenti")
+        self.chk_onion_next = QCheckBox("onion successivi")
+        self.chk_onion_prev.toggled.connect(self.refresh_preview)
+        self.chk_onion_next.toggled.connect(self.refresh_preview)
         self.onion_range = QSpinBox()
         self.onion_range.valueChanged.connect(self.refresh_preview)
         self.onion_range.setRange(1, 10)
         self.onion_range.setValue(2)
-        self.onion_range.setToolTip("Numero di frame prima/dopo da mostrare")
+        self.onion_range.setToolTip("Numero di frame da mostrare per precedenti/successivi")
         self.preview_move_step = QSpinBox()
         self.preview_move_step.setRange(1, 64)
         self.preview_move_step.setValue(2)
@@ -1908,7 +2083,8 @@ class MainWindow(QMainWindow):
             row.addWidget(btn_plus)
             return wrap
 
-        right_bottom.addWidget(self.chk_onion)
+        right_bottom.addWidget(self.chk_onion_prev)
+        right_bottom.addWidget(self.chk_onion_next)
         right_bottom.addWidget(_spin_group("range", self.onion_range))
         right_bottom.addWidget(_spin_group("spostamento", self.preview_move_step))
         right_bottom.addWidget(_spin_group("tol", self.eyedropper_tol))
@@ -1943,16 +2119,28 @@ class MainWindow(QMainWindow):
         row.addWidget(self.thumb_scroll, 1)
         row.addWidget(self.btn_next)
 
-        self.frame_slider = QSlider(Qt.Horizontal)
-        self.frame_slider.setRange(2, 24)
-        self.frame_slider.setValue(8)
-        self.frame_slider.valueChanged.connect(self.on_frame_count_changed)
-
         self.frame_label = QLabel("FRAME 1/8")
         self.frame_label.setAlignment(Qt.AlignCenter)
 
+        frame_controls = QHBoxLayout()
+        frame_controls.addWidget(QLabel("frame totali"))
+        self.frame_count_input = QSpinBox()
+        self.frame_count_input.setRange(2, 240)
+        self.frame_count_input.setValue(len(self.frames))
+        self.frame_count_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.frame_count_input.setKeyboardTracking(False)
+        self.frame_count_input.valueChanged.connect(self.on_frame_count_changed)
+        frame_controls.addWidget(self.frame_count_input)
+        frame_controls.addStretch(1)
+
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setRange(1, len(self.frames))
+        self.frame_slider.setValue(self.selected_index + 1)
+        self.frame_slider.valueChanged.connect(self.on_timeline_slider_changed)
+
         bottom.addLayout(row)
         bottom.addWidget(self.frame_label)
+        bottom.addLayout(frame_controls)
         bottom.addWidget(self.frame_slider)
 
         main.addLayout(top, 3)
@@ -2074,7 +2262,8 @@ class MainWindow(QMainWindow):
             "gemini_model": self.gemini_model.text().strip(),
             "frame_count": len(self.frames),
             "selected_index": self.selected_index,
-            "onion_enabled": bool(self.chk_onion.isChecked()),
+            "onion_prev_enabled": bool(self.chk_onion_prev.isChecked()),
+            "onion_next_enabled": bool(self.chk_onion_next.isChecked()),
             "onion_range": int(self.onion_range.value()),
             "move_step": int(self.preview_move_step.value()),
             "eyedropper_tol": int(self.eyedropper_tol.value()),
@@ -2162,7 +2351,9 @@ class MainWindow(QMainWindow):
                 self.force_rig_warp.setChecked(bool(project.get("force_rig_warp", self.force_rig_warp.isChecked())))
                 self.sdxl_base_model_path.setText((project.get("sdxl_base_model_path", self.sdxl_base_model_path.text()) or "").strip())
 
-                self.chk_onion.setChecked(bool(project.get("onion_enabled", False)))
+                legacy_onion = bool(project.get("onion_enabled", False))
+                self.chk_onion_prev.setChecked(bool(project.get("onion_prev_enabled", legacy_onion)))
+                self.chk_onion_next.setChecked(bool(project.get("onion_next_enabled", legacy_onion)))
                 self.onion_range.setValue(int(project.get("onion_range", 2)))
                 self.preview_move_step.setValue(int(project.get("move_step", 2)))
                 self.eyedropper_tol.setValue(int(project.get("eyedropper_tol", 10)))
@@ -2194,8 +2385,12 @@ class MainWindow(QMainWindow):
 
                 self.selected_index = int(project.get("selected_index", 0))
                 self.selected_index = max(0, min(self.selected_index, len(self.frames) - 1))
+                self.frame_count_input.blockSignals(True)
+                self.frame_count_input.setValue(len(self.frames))
+                self.frame_count_input.blockSignals(False)
                 self.frame_slider.blockSignals(True)
-                self.frame_slider.setValue(len(self.frames))
+                self.frame_slider.setRange(1, len(self.frames))
+                self.frame_slider.setValue(self.selected_index + 1)
                 self.frame_slider.blockSignals(False)
 
                 self.playing = False
@@ -2231,6 +2426,13 @@ class MainWindow(QMainWindow):
         self.rebuild_thumbs()
         self.refresh_preview()
         self.update_frame_label()
+        self.frame_count_input.blockSignals(True)
+        self.frame_count_input.setValue(len(self.frames))
+        self.frame_count_input.blockSignals(False)
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(1, len(self.frames))
+        self.frame_slider.setValue(self.selected_index + 1)
+        self.frame_slider.blockSignals(False)
         self.sync_keyframe_editor()
         self.btn_generate_frames.setEnabled(True)
 
@@ -2378,11 +2580,19 @@ class MainWindow(QMainWindow):
             self.selected_index = min(self.selected_index, n - 1)
         self.refresh_ui()
 
+    def on_timeline_slider_changed(self, value: int):
+        self.set_selected_frame(value - 1)
+
     def set_selected_frame(self, idx: int):
         self.selected_index = max(0, min(idx, len(self.frames) - 1))
         self.refresh_thumbs()
+        if 0 <= self.selected_index < len(self.thumbs):
+            self.thumb_scroll.ensureWidgetVisible(self.thumbs[self.selected_index], 32, 0)
         self.refresh_preview()
         self.update_frame_label()
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setValue(self.selected_index + 1)
+        self.frame_slider.blockSignals(False)
         self.sync_keyframe_editor()
     def handle_frame_drop(self, src_idx: int, dst_idx: int, local_pos: QPoint, source_widget: QWidget):
         if src_idx == dst_idx:
