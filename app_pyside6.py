@@ -5,10 +5,19 @@ import sys
 import zipfile
 import base64
 import json
+import warnings
+from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# Silence known third-party startup warnings that do not affect app behavior.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Overwriting tiny_vit_.* in registry.*",
+    category=UserWarning,
+)
 
 import numpy as np
 import requests
@@ -42,7 +51,12 @@ from PySide6.QtWidgets import (
 )
 
 from controlnet_aux import OpenposeDetector
-from diffusers import ControlNetModel, StableDiffusionControlNetPipeline, UniPCMultistepScheduler
+from diffusers import (
+    ControlNetModel,
+    StableDiffusionXLControlNetImg2ImgPipeline,
+    StableDiffusionXLControlNetPipeline,
+    UniPCMultistepScheduler,
+)
 
 try:
     from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
@@ -64,6 +78,7 @@ class SizePlan:
 @dataclass
 class FrameData:
     image: Optional[Image.Image] = None
+    image_unkeyed: Optional[Image.Image] = None
     image_offset: Tuple[int, int] = (0, 0)
     rig_nodes: Optional[Dict[str, Tuple[float, float]]] = None
     bone_lengths: Optional[Dict[Tuple[str, str], float]] = None
@@ -73,6 +88,7 @@ class FrameData:
     rig_profile: str = "auto"  # auto | human | animal | object
     detected_profile: str = "human"
     generated: Optional[Image.Image] = None
+    bone_correspondence: Optional[Dict[Tuple[str, str], str]] = None
 
 
 HUMAN_BONES = [
@@ -124,6 +140,9 @@ RIG_COLORS = {
     "right": (59, 130, 246),
     "center": (249, 115, 22),
 }
+
+SDXL_BASE_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+SDXL_CONTROLNET_OPENPOSE_ID = "xinsir/controlnet-openpose-sdxl-1.0"
 
 
 def pil_to_qpixmap(img: Image.Image) -> QPixmap:
@@ -356,6 +375,163 @@ def compute_bone_lengths(nodes: Dict[str, Tuple[float, float]], bones: List[Tupl
     return out
 
 
+def build_subject_mask(img: Optional[Image.Image]) -> Optional[np.ndarray]:
+    if img is None:
+        return None
+    rgba = np.array(img.convert("RGBA"))
+    alpha = rgba[..., 3]
+    mask = alpha > 10
+    if mask.any():
+        return mask
+    rgb = rgba[..., :3].astype(np.int16)
+    bg = np.median(rgb.reshape(-1, 3), axis=0)
+    dist = np.abs(rgb - bg).sum(axis=2)
+    return dist > 24
+
+
+def segment_coverage(mask: np.ndarray, a: Tuple[float, float], b: Tuple[float, float], samples: int = 28) -> float:
+    h, w = mask.shape
+    hits = 0
+    total = max(2, samples)
+    for s in range(total):
+        t = s / float(total - 1)
+        x = int(round(a[0] + (b[0] - a[0]) * t))
+        y = int(round(a[1] + (b[1] - a[1]) * t))
+        x = max(0, min(w - 1, x))
+        y = max(0, min(h - 1, y))
+        if mask[y, x]:
+            hits += 1
+    return hits / float(total)
+
+
+def estimate_bone_raster_reference(
+    nodes: Dict[str, Tuple[float, float]],
+    bones: List[Tuple[str, str]],
+    img: Optional[Image.Image],
+) -> Dict[Tuple[str, str], float]:
+    mask = build_subject_mask(img)
+    out: Dict[Tuple[str, str], float] = {}
+    for a, b in bones:
+        if a not in nodes or b not in nodes:
+            continue
+        if mask is None:
+            out[(a, b)] = 0.45
+        else:
+            out[(a, b)] = float(segment_coverage(mask, nodes[a], nodes[b]))
+    return out
+
+
+def derive_node_mobility(
+    nodes: Dict[str, Tuple[float, float]],
+    bones: List[Tuple[str, str]],
+    bone_ref: Dict[Tuple[str, str], float],
+) -> Dict[str, float]:
+    acc: Dict[str, float] = {n: 0.0 for n in nodes.keys()}
+    cnt: Dict[str, int] = {n: 0 for n in nodes.keys()}
+    for a, b in bones:
+        cov = bone_ref.get((a, b), 0.45)
+        if a in acc:
+            acc[a] += cov
+            cnt[a] += 1
+        if b in acc:
+            acc[b] += cov
+            cnt[b] += 1
+    out: Dict[str, float] = {}
+    for n in nodes.keys():
+        avg_cov = acc[n] / max(1, cnt[n])
+        out[n] = max(0.35, min(1.0, 1.05 - avg_cov * 0.70))
+    return out
+
+
+def _bone_feature(
+    nodes: Dict[str, Tuple[float, float]],
+    bone: Tuple[str, str],
+    canvas_size: Tuple[int, int],
+    mask: Optional[np.ndarray],
+) -> Optional[Tuple[float, float, float, float, float]]:
+    a, b = bone
+    if a not in nodes or b not in nodes:
+        return None
+    w, h = max(1, canvas_size[0]), max(1, canvas_size[1])
+    ax, ay = nodes[a]
+    bx, by = nodes[b]
+    mx = ((ax + bx) * 0.5) / w
+    my = ((ay + by) * 0.5) / h
+    ln = math.hypot((bx - ax) / w, (by - ay) / h)
+    ang = (math.atan2(by - ay, bx - ax) + math.pi) / (2.0 * math.pi)
+    cov = 0.5
+    if mask is not None:
+        cov = float(segment_coverage(mask, (ax, ay), (bx, by)))
+    return mx, my, ln, ang, cov
+
+
+def _angle_wrap_dist(a: float, b: float) -> float:
+    d = abs(a - b)
+    return min(d, 1.0 - d)
+
+
+def infer_bone_correspondence(
+    nodes: Dict[str, Tuple[float, float]],
+    bones: List[Tuple[str, str]],
+    template_nodes: Dict[str, Tuple[float, float]],
+    template_bones: List[Tuple[str, str]],
+    canvas_size: Tuple[int, int],
+    mask: Optional[np.ndarray],
+) -> Dict[Tuple[str, str], str]:
+    def _norm_bone(b):
+        if isinstance(b, (list, tuple)) and len(b) == 2:
+            return (str(b[0]), str(b[1]))
+        return None
+
+    out: Dict[Tuple[str, str], str] = {}
+    cur_feat: Dict[Tuple[str, str], Tuple[float, float, float, float, float]] = {}
+    tpl_feat: Dict[Tuple[str, str], Tuple[float, float, float, float, float]] = {}
+    norm_bones = [nb for nb in (_norm_bone(b) for b in bones) if nb is not None]
+    norm_tpl_bones = [nb for nb in (_norm_bone(b) for b in template_bones) if nb is not None]
+    for b in norm_bones:
+        f = _bone_feature(nodes, b, canvas_size, mask)
+        if f is not None:
+            cur_feat[b] = f
+    for b in norm_tpl_bones:
+        f = _bone_feature(template_nodes, b, canvas_size, mask)
+        if f is not None:
+            tpl_feat[b] = f
+    if not cur_feat or not tpl_feat:
+        return out
+
+    candidates: List[Tuple[float, Tuple[str, str], Tuple[str, str]]] = []
+    for cb, cf in cur_feat.items():
+        for tb, tf in tpl_feat.items():
+            side_pen = 0.0
+            c_left = cb[0].startswith("l_") or cb[1].startswith("l_")
+            c_right = cb[0].startswith("r_") or cb[1].startswith("r_")
+            t_left = tb[0].startswith("l_") or tb[1].startswith("l_")
+            t_right = tb[0].startswith("r_") or tb[1].startswith("r_")
+            if (c_left and t_right) or (c_right and t_left):
+                side_pen = 0.45
+            md = math.hypot(cf[0] - tf[0], cf[1] - tf[1])
+            ld = abs(cf[2] - tf[2])
+            ad = _angle_wrap_dist(cf[3], tf[3])
+            cd = abs(cf[4] - tf[4])
+            score = md + 0.35 * ld + 0.30 * ad + 0.20 * cd + side_pen
+            candidates.append((score, cb, tb))
+
+    candidates.sort(key=lambda x: x[0])
+    used_cur = set()
+    used_tpl = set()
+    for _, cb, tb in candidates:
+        if cb in used_cur or tb in used_tpl:
+            continue
+        used_cur.add(cb)
+        used_tpl.add(tb)
+        out[cb] = f"{tb[0]}->{tb[1]}"
+
+    for b in norm_bones:
+        if b not in out:
+            out[b] = f"{b[0]}->{b[1]}"
+    return out
+
+
 def apply_rig_constraints(
     nodes: Dict[str, Tuple[float, float]],
     lengths: Dict[Tuple[str, str], float],
@@ -439,7 +615,7 @@ def scale_rig_nodes(nodes: Dict[str, Tuple[float, float]], old_size: Tuple[int, 
     return {k: (x * sx, y * sy) for k, (x, y) in nodes.items()}
 
 
-def apply_chroma_key(img: Image.Image, key_rgb: tuple, tol: int) -> Image.Image:
+def apply_chroma_key(img: Image.Image, key_rgb: tuple, tol: int, edge_connected: bool = False) -> Image.Image:
     rgba = img.convert("RGBA")
     data = np.array(rgba)
     r = data[..., 0].astype(np.int16)
@@ -454,8 +630,52 @@ def apply_chroma_key(img: Image.Image, key_rgb: tuple, tol: int) -> Image.Image:
     alpha = data[..., 3]
     if mask.shape != alpha.shape and mask.T.shape == alpha.shape:
         mask = mask.T
+    if edge_connected:
+        h, w = mask.shape
+        bg = np.zeros_like(mask, dtype=bool)
+        q = deque()
+        for x in range(w):
+            if mask[0, x]:
+                bg[0, x] = True
+                q.append((0, x))
+            if mask[h - 1, x] and not bg[h - 1, x]:
+                bg[h - 1, x] = True
+                q.append((h - 1, x))
+        for y in range(h):
+            if mask[y, 0] and not bg[y, 0]:
+                bg[y, 0] = True
+                q.append((y, 0))
+            if mask[y, w - 1] and not bg[y, w - 1]:
+                bg[y, w - 1] = True
+                q.append((y, w - 1))
+        while q:
+            y, x = q.popleft()
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+                if not mask[ny, nx] or bg[ny, nx]:
+                    continue
+                bg[ny, nx] = True
+                q.append((ny, nx))
+        mask = bg
     data[..., 3] = np.where(mask, 0, alpha)
     return Image.fromarray(data)
+
+
+def pick_effective_key_color(img: Image.Image, preferred_rgb: Tuple[int, int, int], tol: int) -> Tuple[int, int, int]:
+    rgb = np.array(img.convert("RGB"))
+    top = rgb[0, :, :]
+    bottom = rgb[-1, :, :]
+    left = rgb[:, 0, :]
+    right = rgb[:, -1, :]
+    border = np.concatenate([top, bottom, left, right], axis=0).astype(np.int16)
+    p = np.array(preferred_rgb, dtype=np.int16)
+    dist = np.abs(border - p).sum(axis=1)
+    hits = float(np.mean(dist <= max(3, tol * 3)))
+    if hits >= 0.01:
+        return preferred_rgb
+    med = np.median(border, axis=0)
+    return (int(med[0]), int(med[1]), int(med[2]))
 
 
 def recenter_on_canvas(img: Image.Image, target_w: int, target_h: int, dx: int, dy: int) -> Image.Image:
@@ -501,6 +721,124 @@ def blend_pose(a: Image.Image, b: Image.Image, t: float) -> Image.Image:
     return Image.blend(a, b, max(0.0, min(1.0, t)))
 
 
+def quantize_to_reference_palette(
+    img: Image.Image, ref_img: Image.Image, max_colors: int = 64
+) -> Image.Image:
+    src_rgb = img.convert("RGB")
+    ref_rgb = ref_img.convert("RGB")
+    palette_src = ref_rgb.quantize(colors=max(2, min(256, int(max_colors))), method=Image.MEDIANCUT)
+    quant = src_rgb.quantize(palette=palette_src, dither=Image.NONE)
+    return quant.convert("RGBA")
+
+
+def _rig_anchor(nodes: Dict[str, Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+    for n in ("hip", "center", "neck", "spine", "pivot"):
+        if n in nodes:
+            return nodes[n]
+    if not nodes:
+        return None
+    xs = [p[0] for p in nodes.values()]
+    ys = [p[1] for p in nodes.values()]
+    return (float(sum(xs) / len(xs)), float(sum(ys) / len(ys)))
+
+
+def estimate_global_rig_shift(
+    prev_nodes: Dict[str, Tuple[float, float]], curr_nodes: Dict[str, Tuple[float, float]]
+) -> Tuple[int, int]:
+    pa = _rig_anchor(prev_nodes)
+    ca = _rig_anchor(curr_nodes)
+    if pa is None or ca is None:
+        return 0, 0
+    return int(round(ca[0] - pa[0])), int(round(ca[1] - pa[1]))
+
+
+def rig_motion_score(
+    prev_nodes: Dict[str, Tuple[float, float]],
+    curr_nodes: Dict[str, Tuple[float, float]],
+    canvas_size: Tuple[int, int],
+) -> float:
+    common = set(prev_nodes.keys()) & set(curr_nodes.keys())
+    if not common:
+        return 0.0
+    w, h = max(1, int(canvas_size[0])), max(1, int(canvas_size[1]))
+    diag = max(1.0, math.hypot(w, h))
+    acc = 0.0
+    for n in common:
+        px, py = prev_nodes[n]
+        cx, cy = curr_nodes[n]
+        acc += math.hypot(cx - px, cy - py)
+    mean_disp = acc / max(1, len(common))
+    # Normalize so typical limb motion yields a noticeable boost.
+    score = mean_disp / (0.14 * diag)
+    return max(0.0, min(1.0, score))
+
+
+def warp_sprite_with_rig(
+    base_img: Image.Image,
+    base_nodes: Dict[str, Tuple[float, float]],
+    target_nodes: Dict[str, Tuple[float, float]],
+) -> Image.Image:
+    src = np.array(base_img.convert("RGBA"))
+    h, w = src.shape[:2]
+    common = [n for n in base_nodes.keys() if n in target_nodes]
+    if not common:
+        return base_img.convert("RGBA")
+
+    anchors = np.array([[base_nodes[n][0], base_nodes[n][1]] for n in common], dtype=np.float32)
+    deltas = np.array(
+        [[target_nodes[n][0] - base_nodes[n][0], target_nodes[n][1] - base_nodes[n][1]] for n in common],
+        dtype=np.float32,
+    )
+    deltas[:, 0] = np.clip(deltas[:, 0], -0.40 * w, 0.40 * w)
+    deltas[:, 1] = np.clip(deltas[:, 1], -0.40 * h, 0.40 * h)
+    alpha = src[..., 3] > 0
+    visited = np.zeros((h, w), dtype=bool)
+    out = np.zeros_like(src)
+
+    # Move connected alpha components as rigid 2D cutouts to avoid stretching artifacts.
+    for y0 in range(h):
+        for x0 in range(w):
+            if not alpha[y0, x0] or visited[y0, x0]:
+                continue
+            q = deque([(y0, x0)])
+            visited[y0, x0] = True
+            pts: List[Tuple[int, int]] = []
+            while q:
+                y, x = q.popleft()
+                pts.append((y, x))
+                if y > 0 and alpha[y - 1, x] and not visited[y - 1, x]:
+                    visited[y - 1, x] = True
+                    q.append((y - 1, x))
+                if y + 1 < h and alpha[y + 1, x] and not visited[y + 1, x]:
+                    visited[y + 1, x] = True
+                    q.append((y + 1, x))
+                if x > 0 and alpha[y, x - 1] and not visited[y, x - 1]:
+                    visited[y, x - 1] = True
+                    q.append((y, x - 1))
+                if x + 1 < w and alpha[y, x + 1] and not visited[y, x + 1]:
+                    visited[y, x + 1] = True
+                    q.append((y, x + 1))
+
+            xs = np.array([p[1] for p in pts], dtype=np.float32)
+            ys = np.array([p[0] for p in pts], dtype=np.float32)
+            cx = float(xs.mean())
+            cy = float(ys.mean())
+            d2 = (anchors[:, 0] - cx) ** 2 + (anchors[:, 1] - cy) ** 2
+            idx = int(np.argmin(d2))
+            dx = int(round(float(deltas[idx, 0])))
+            dy = int(round(float(deltas[idx, 1])))
+
+            for y, x in pts:
+                ny = y + dy
+                nx = x + dx
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+                if src[y, x, 3] >= out[ny, nx, 3]:
+                    out[ny, nx] = src[y, x]
+
+    return Image.fromarray(out, mode="RGBA")
+
+
 @lru_cache(maxsize=1)
 def load_openpose() -> OpenposeDetector:
     return OpenposeDetector.from_pretrained("lllyasviel/Annotators")
@@ -509,13 +847,58 @@ def load_openpose() -> OpenposeDetector:
 @lru_cache(maxsize=4)
 def load_pipe(base_model_id: str, controlnet_id: str, use_cuda: bool):
     dtype = torch.float16 if use_cuda else torch.float32
-    controlnet = ControlNetModel.from_pretrained(controlnet_id, torch_dtype=dtype)
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
-        base_model_id, controlnet=controlnet, torch_dtype=dtype, safety_checker=None
+    controlnet = ControlNetModel.from_pretrained(
+        controlnet_id,
+        torch_dtype=dtype,
+        use_safetensors=True,
     )
+    base_path = Path(base_model_id)
+    if base_path.is_file() and base_path.suffix.lower() in (".safetensors", ".ckpt"):
+        pipe = StableDiffusionXLControlNetPipeline.from_single_file(
+            str(base_path),
+            controlnet=controlnet,
+            torch_dtype=dtype,
+        )
+    else:
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(base_model_id, controlnet=controlnet, torch_dtype=dtype)
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
     if use_cuda:
-        pipe.enable_xformers_memory_efficient_attention()
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            # xformers is optional; keep running with standard attention.
+            pass
+        pipe.to("cuda")
+    else:
+        pipe.enable_attention_slicing()
+        pipe.to("cpu")
+    return pipe
+
+
+@lru_cache(maxsize=4)
+def load_pipe_img2img(base_model_id: str, controlnet_id: str, use_cuda: bool):
+    dtype = torch.float16 if use_cuda else torch.float32
+    controlnet = ControlNetModel.from_pretrained(
+        controlnet_id,
+        torch_dtype=dtype,
+        use_safetensors=True,
+    )
+    base_path = Path(base_model_id)
+    if base_path.is_file() and base_path.suffix.lower() in (".safetensors", ".ckpt"):
+        pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_single_file(
+            str(base_path),
+            controlnet=controlnet,
+            torch_dtype=dtype,
+        )
+    else:
+        pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(base_model_id, controlnet=controlnet, torch_dtype=dtype)
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    if use_cuda:
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            # xformers is optional; keep running with standard attention.
+            pass
         pipe.to("cuda")
     else:
         pipe.enable_attention_slicing()
@@ -546,7 +929,44 @@ def pil_to_inline_data(img: Image.Image) -> Dict[str, str]:
     return {"mimeType": "image/png", "data": b64}
 
 
+def normalize_gemini_api_key(api_key: str) -> str:
+    key = (api_key or "").strip().strip("\"").strip("'")
+    # Remove hidden whitespace/newline characters accidentally copied with the key.
+    key = "".join(ch for ch in key if ch.isprintable() and not ch.isspace())
+    return key
+
+
+def format_gemini_http_error(res: requests.Response) -> str:
+    try:
+        payload = res.json()
+        err = payload.get("error", {}) if isinstance(payload, dict) else {}
+        status = err.get("status", "")
+        message = (err.get("message", "") or "").strip()
+        reasons = []
+        details = err.get("details", [])
+        if isinstance(details, list):
+            for d in details:
+                if isinstance(d, dict):
+                    r = d.get("reason")
+                    if isinstance(r, str) and r and r not in reasons:
+                        reasons.append(r)
+        reason_txt = ",".join(reasons)
+        parts = [f"Gemini HTTP {res.status_code}"]
+        if status:
+            parts.append(f"status={status}")
+        if reason_txt:
+            parts.append(f"reason={reason_txt}")
+        if message:
+            parts.append(f"message={message}")
+        return " ".join(parts)
+    except Exception:
+        body = (res.text or "").strip().replace("\n", " ")
+        body = body[:500]
+        return f"Gemini HTTP {res.status_code} body={body}"
+
+
 def gemini_describe_image(api_key: str, model: str, img: Image.Image, hint: str = "") -> str:
+    api_key = normalize_gemini_api_key(api_key)
     prompt = (
         "Descrivi in modo preciso il soggetto principale, stile, colori e inquadratura. "
         "Non inventare elementi non presenti. Rispondi con 1-3 frasi concise."
@@ -568,11 +988,12 @@ def gemini_describe_image(api_key: str, model: str, img: Image.Image, hint: str 
     res = requests.post(
         url,
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        params={"key": api_key},
         json=body,
         timeout=60,
     )
     if not res.ok:
-        raise RuntimeError(f"Gemini error {res.status_code}: {res.text[:240]}")
+        raise RuntimeError(format_gemini_http_error(res))
     payload = res.json()
     parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
     text = "\n".join([p.get("text", "") for p in parts if p.get("text")]).strip()
@@ -591,6 +1012,7 @@ def gemini_generate_rig_animation(
     key_descriptions: Dict[int, str],
     key_nodes: Optional[Dict[int, Dict[str, Tuple[float, float]]]] = None,
 ) -> List[Dict[str, Tuple[float, float]]]:
+    api_key = normalize_gemini_api_key(api_key)
     # Ask Gemini for normalized coordinates per frame (0..1)
     node_list = list(base_nodes.keys())
     skeleton_hint = "; ".join([f"{a}-{b}" for a, b in bones])
@@ -641,11 +1063,12 @@ def gemini_generate_rig_animation(
             res = requests.post(
                 url,
                 headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                params={"key": api_key},
                 json=body,
                 timeout=120,
             )
             if not res.ok:
-                raise RuntimeError(f"Gemini error {res.status_code}: {res.text[:240]}")
+                raise RuntimeError(format_gemini_http_error(res))
             payload = res.json()
             parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
             text = "\n".join([p.get("text", "") for p in parts if p.get("text")]).strip()
@@ -1036,6 +1459,12 @@ class VectorPreviewWidget(QWidget):
                             painter.drawEllipse(wx - 4, wy - 4, 8, 8)
 
             bones = self._frame_bones(fr)
+            corr_map: Dict[Tuple[str, str], str] = {}
+            show_map = hasattr(self.parent_win, "chk_bone_map") and self.parent_win.chk_bone_map.isChecked()
+            if show_map:
+                corr_map = fr.bone_correspondence or self.parent_win.analyze_frame_bone_correspondence(
+                    self.parent_win.selected_index, log_result=False
+                )
             used_nodes = set()
             for a, b in bones:
                 if a not in fr.rig_nodes or b not in fr.rig_nodes:
@@ -1054,6 +1483,16 @@ class VectorPreviewWidget(QWidget):
                     c = QColor(*RIG_COLORS["center"])
                 painter.setPen(QPen(c, 3))
                 painter.drawLine(awx, awy, bwx, bwy)
+                if show_map:
+                    label = corr_map.get((a, b), f"{a}->{b}")
+                    mx = int((awx + bwx) * 0.5)
+                    my = int((awy + bwy) * 0.5)
+                    text_rect = QRect(mx - 58, my - 18, 116, 14)
+                    painter.setPen(QPen(QColor(255, 255, 255), 1))
+                    painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
+                    painter.drawRect(text_rect)
+                    painter.setPen(QPen(QColor("#0f172a"), 1))
+                    painter.drawText(text_rect.adjusted(2, 0, -2, 0), Qt.AlignCenter, label)
 
             for n, (x, y) in fr.rig_nodes.items():
                 if n not in used_nodes:
@@ -1252,6 +1691,7 @@ class MainWindow(QMainWindow):
         self.build_ui()
         self.load_config()
         self.refresh_ui()
+        self.log_runtime_device()
 
     def build_menu(self):
         menu = self.menuBar().addMenu("Progetto")
@@ -1329,10 +1769,31 @@ class MainWindow(QMainWindow):
         self.btn_generate_frames = QPushButton("genera raster")
         self.btn_generate_frames.clicked.connect(self.generate_final_frames)
         self.btn_generate_frames.setEnabled(True)
+        self.gen_strength = QDoubleSpinBox()
+        self.gen_strength.setRange(0.1, 0.95)
+        self.gen_strength.setSingleStep(0.05)
+        self.gen_strength.setValue(0.42)
+        self.gen_strength.setPrefix("img2img strength ")
+        self.control_weight = QDoubleSpinBox()
+        self.control_weight.setRange(0.2, 2.5)
+        self.control_weight.setSingleStep(0.1)
+        self.control_weight.setValue(1.2)
+        self.control_weight.setPrefix("control weight ")
+        self.force_rig_warp = QCheckBox("forza rig-warp")
+        self.force_rig_warp.setChecked(True)
+        self.sdxl_base_model_path = QLineEdit("")
+        self.sdxl_base_model_path.setPlaceholderText("Checkpoint SDXL locale (.safetensors/.ckpt) opzionale")
+        self.btn_pick_sdxl_model = QPushButton("modello SDXL...")
+        self.btn_pick_sdxl_model.clicked.connect(self.pick_sdxl_model_path)
 
         left_layout.addWidget(self.btn_generate_pose)
         left_layout.addWidget(self.btn_ai_rig)
         left_layout.addWidget(self.btn_generate_frames)
+        left_layout.addWidget(self.gen_strength)
+        left_layout.addWidget(self.control_weight)
+        left_layout.addWidget(self.force_rig_warp)
+        left_layout.addWidget(self.sdxl_base_model_path)
+        left_layout.addWidget(self.btn_pick_sdxl_model)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -1358,8 +1819,12 @@ class MainWindow(QMainWindow):
         self.chk_pose = QCheckBox("scheletro")
         self.chk_pose.setChecked(True)
         self.chk_pose.toggled.connect(self.refresh_preview)
+        self.chk_bone_map = QCheckBox("map ossa")
+        self.chk_bone_map.setChecked(False)
+        self.chk_bone_map.toggled.connect(self.refresh_preview)
         right_top.addWidget(self.chk_sprite)
         right_top.addWidget(self.chk_pose)
+        right_top.addWidget(self.chk_bone_map)
         self.btn_eyedropper = QPushButton("contagocce")
         self.btn_eyedropper.setCheckable(True)
         self.btn_eyedropper.toggled.connect(self.toggle_eyedropper_mode)
@@ -1517,6 +1982,16 @@ class MainWindow(QMainWindow):
     def log(self, msg: str):
         self.log_box.append(msg)
 
+    def log_runtime_device(self):
+        try:
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                self.log(f"[runtime] CUDA ON - GPU: {gpu_name}")
+            else:
+                self.log("[runtime] CUDA OFF - uso CPU")
+        except Exception as e:
+            self.log(f"[runtime] Stato CUDA non disponibile: {e}")
+
     def _config_path(self) -> Path:
         return Path.home() / ".animator" / "config.json"
 
@@ -1532,6 +2007,18 @@ class MainWindow(QMainWindow):
             model = (data.get("gemini_model") or "").strip()
             if model:
                 self.gemini_model.setText(model)
+            strength = data.get("gen_strength")
+            if strength is not None:
+                self.gen_strength.setValue(max(0.1, min(0.95, float(strength))))
+            ctrl = data.get("control_weight")
+            if ctrl is not None:
+                self.control_weight.setValue(max(0.2, min(2.5, float(ctrl))))
+            frw = data.get("force_rig_warp")
+            if frw is not None:
+                self.force_rig_warp.setChecked(bool(frw))
+            mdl = (data.get("sdxl_base_model_path") or "").strip()
+            if mdl:
+                self.sdxl_base_model_path.setText(mdl)
         except Exception as e:
             self.log(f"Errore lettura config: {e}")
 
@@ -1542,6 +2029,10 @@ class MainWindow(QMainWindow):
             payload = {
                 "gemini_api_key": self.gemini_api_key.text().strip(),
                 "gemini_model": self.gemini_model.text().strip(),
+                "gen_strength": float(self.gen_strength.value()),
+                "control_weight": float(self.control_weight.value()),
+                "force_rig_warp": bool(self.force_rig_warp.isChecked()),
+                "sdxl_base_model_path": self.sdxl_base_model_path.text().strip(),
             }
             cfg_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
         except Exception as e:
@@ -1590,6 +2081,10 @@ class MainWindow(QMainWindow):
             "last_eyedrop_color": list(self.last_eyedrop_color),
             "show_raster": bool(self.chk_sprite.isChecked()),
             "show_skeleton": bool(self.chk_pose.isChecked()),
+            "gen_strength": float(self.gen_strength.value()),
+            "control_weight": float(self.control_weight.value()),
+            "force_rig_warp": bool(self.force_rig_warp.isChecked()),
+            "sdxl_base_model_path": self.sdxl_base_model_path.text().strip(),
             "topology_bones": self.topology_bones or [],
             "topology_new_node_counter": int(self.topology_new_node_counter),
             "frames": [self._frame_to_project_dict(fr, i) for i, fr in enumerate(self.frames)],
@@ -1641,6 +2136,7 @@ class MainWindow(QMainWindow):
                     if img_path:
                         with zf.open(img_path) as f:
                             fr.image = Image.open(io.BytesIO(f.read())).convert("RGBA")
+                            fr.image_unkeyed = fr.image.copy()
                     gen_path = fd.get("generated")
                     if gen_path:
                         with zf.open(gen_path) as f:
@@ -1661,6 +2157,10 @@ class MainWindow(QMainWindow):
                 self.caption_hint.setPlainText(project.get("caption_hint", "") or "")
                 self.use_gemini_caption.setChecked(bool(project.get("use_gemini_caption", True)))
                 self.gemini_model.setText(project.get("gemini_model", "gemini-2.5-flash"))
+                self.gen_strength.setValue(max(0.1, min(0.95, float(project.get("gen_strength", self.gen_strength.value())))))
+                self.control_weight.setValue(max(0.2, min(2.5, float(project.get("control_weight", self.control_weight.value())))))
+                self.force_rig_warp.setChecked(bool(project.get("force_rig_warp", self.force_rig_warp.isChecked())))
+                self.sdxl_base_model_path.setText((project.get("sdxl_base_model_path", self.sdxl_base_model_path.text()) or "").strip())
 
                 self.chk_onion.setChecked(bool(project.get("onion_enabled", False)))
                 self.onion_range.setValue(int(project.get("onion_range", 2)))
@@ -1674,7 +2174,15 @@ class MainWindow(QMainWindow):
                 self.chk_sprite.setChecked(bool(project.get("show_raster", True)))
                 self.chk_pose.setChecked(bool(project.get("show_skeleton", True)))
 
-                self.topology_bones = project.get("topology_bones") or None
+                raw_topology = project.get("topology_bones") or None
+                if isinstance(raw_topology, list):
+                    norm_topology: List[Tuple[str, str]] = []
+                    for b in raw_topology:
+                        if isinstance(b, (list, tuple)) and len(b) == 2:
+                            norm_topology.append((str(b[0]), str(b[1])))
+                    self.topology_bones = norm_topology or None
+                else:
+                    self.topology_bones = None
                 self.topology_new_node_counter = int(project.get("topology_new_node_counter", 1))
 
                 # Recompute bone lengths for loaded frames.
@@ -1706,6 +2214,18 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log(f"Errore importazione progetto: {e}")
             QMessageBox.warning(self, "Errore", f"Importazione fallita: {e}")
+
+    def pick_sdxl_model_path(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleziona checkpoint SDXL",
+            str(Path.cwd()),
+            "Model files (*.safetensors *.ckpt)",
+        )
+        if not path:
+            return
+        self.sdxl_base_model_path.setText(path)
+        self.log(f"[raster] Checkpoint SDXL selezionato: {path}")
 
     def refresh_ui(self):
         self.rebuild_thumbs()
@@ -1748,6 +2268,7 @@ class MainWindow(QMainWindow):
         # Always operate on the base bitmap layer.
         if fr.image is None and fr.generated is not None:
             fr.image = fr.generated.convert("RGBA")
+            fr.image_unkeyed = fr.image.copy()
             fr.generated = None
 
         if fr.image is None:
@@ -1761,13 +2282,16 @@ class MainWindow(QMainWindow):
             self.log("Contagocce: click fuori dal bitmap (offset attivo), nessuna modifica")
             return
 
-        src = fr.image.convert("RGBA")
+        if fr.image_unkeyed is None and fr.image is not None:
+            fr.image_unkeyed = fr.image.convert("RGBA")
+        src = (fr.image_unkeyed or fr.image).convert("RGBA")
         r, g, b, a = src.getpixel((sx, sy))
         if a == 0:
             self.log("Contagocce: pixel gia trasparente, nessuna modifica")
             return
 
-        fr.image = apply_chroma_key(fr.image, (r, g, b), tol)
+        # Re-apply from unkeyed source so the previous key color is replaced, not accumulated.
+        fr.image = apply_chroma_key(src, (r, g, b), tol)
         # Clear generated layer to avoid masking the edited bitmap.
         fr.generated = None
         self.frames[self.selected_index] = fr
@@ -2055,12 +2579,13 @@ class MainWindow(QMainWindow):
         img = ImageEnhance.Brightness(img).enhance(brightness)
         img = ImageEnhance.Contrast(img).enhance(contrast)
         img = ImageEnhance.Color(img).enhance(saturation)
+        fr.image_unkeyed = img.copy()
 
         if key_enabled and len(key_color) == 7 and key_color.startswith("#"):
             kr = int(key_color[1:3], 16)
             kg = int(key_color[3:5], 16)
             kb = int(key_color[5:7], 16)
-            img = apply_chroma_key(img, (kr, kg, kb), key_tol)
+            img = apply_chroma_key(fr.image_unkeyed, (kr, kg, kb), key_tol)
 
         fr.image = img
         fr.image_offset = (0, 0)
@@ -2105,8 +2630,52 @@ class MainWindow(QMainWindow):
         if self.topology_bones is None and self.frames and self.frames[0].rig_nodes is not None:
             self.initialize_topology_from_frame1()
         if self.topology_bones is not None:
+            norm_topology: List[Tuple[str, str]] = []
+            for b in self.topology_bones:
+                if isinstance(b, (list, tuple)) and len(b) == 2:
+                    norm_topology.append((str(b[0]), str(b[1])))
+            self.topology_bones = norm_topology
             return self.topology_bones
         return RIG_BONES_BY_PROFILE.get(self.resolve_rig_profile(fr), HUMAN_BONES)
+
+    def analyze_frame_bone_correspondence(self, idx: int, log_result: bool = False) -> Dict[Tuple[str, str], str]:
+        if idx < 0 or idx >= len(self.frames):
+            return {}
+        fr = self.frames[idx]
+        if fr.rig_nodes is None:
+            return {}
+        bones = self.get_frame_bones(fr)
+        if not bones:
+            return {}
+        ref_img = fr.image or fr.generated or self.frames[0].image
+        if ref_img is None:
+            return {}
+        canvas_size = self.get_frame_canvas_size(idx) or ref_img.size
+        mask = build_subject_mask(ref_img)
+
+        profile = self.resolve_rig_profile(fr)
+        template_bones = RIG_BONES_BY_PROFILE.get(profile, HUMAN_BONES)
+        template_nodes = self.create_default_rig(ref_img, fr)
+        if template_nodes is None:
+            mapped = {b: f"{b[0]}->{b[1]}" for b in bones}
+            fr.bone_correspondence = mapped
+            self.frames[idx] = fr
+            return mapped
+
+        mapped = infer_bone_correspondence(
+            fr.rig_nodes,
+            bones,
+            template_nodes,
+            template_bones,
+            canvas_size,
+            mask,
+        )
+        fr.bone_correspondence = mapped
+        self.frames[idx] = fr
+        if log_result:
+            sample = ", ".join([f"{a}->{b}:{role}" for (a, b), role in list(mapped.items())[:8]])
+            self.log(f"[debug/bone-map] frame {idx + 1}: segmenti={len(mapped)} sample={sample}")
+        return mapped
 
     def _topology_nodes_set(self) -> set:
         if self.topology_bones is None:
@@ -2334,6 +2903,7 @@ class MainWindow(QMainWindow):
         if self.frames[idx].is_keyframe and not key_desc:
             key_desc = cap
         self.frames[idx].image = img
+        self.frames[idx].image_unkeyed = img.copy()
         self.frames[idx].image_offset = (0, 0)
         self.frames[idx].generated = None
         self.frames[idx].rig_nodes = rig
@@ -2371,14 +2941,208 @@ class MainWindow(QMainWindow):
             swing = 0.02
         return amp, bob, swing
 
+    def _log_gemini_motion_debug(self, key_idxs: List[int], explicit_keys: List[int]):
+        prompt_text = (self.prompt.toPlainText() or "").strip()
+        prompt_preview = prompt_text[:180] + ("..." if len(prompt_text) > 180 else "")
+        has_api = bool(self.gemini_api_key.text().strip())
+        model_name = self.gemini_model.text().strip() or "gemini-2.5-flash"
+        frames_with_rig = [i + 1 for i, fr in enumerate(self.frames) if fr.rig_nodes is not None]
+        frame_profiles = [self.resolve_rig_profile(fr) for fr in self.frames]
+
+        self.log("[debug/gemini-motion] ----")
+        self.log(f"[debug/gemini-motion] use_gemini_caption={self.use_gemini_caption.isChecked()} api_key_set={has_api}")
+        self.log(f"[debug/gemini-motion] model={model_name}")
+        self.log(f"[debug/gemini-motion] frames={len(self.frames)} frames_with_rig={frames_with_rig}")
+        self.log(f"[debug/gemini-motion] explicit_keyframes={[i + 1 for i in explicit_keys]} anchors={[i + 1 for i in key_idxs]}")
+        self.log(f"[debug/gemini-motion] rig_profiles={frame_profiles}")
+        self.log(f"[debug/gemini-motion] prompt='{prompt_preview or '(vuoto)'}'")
+        if not has_api:
+            self.log("[debug/gemini-motion] API key Gemini assente -> fallback locale")
+        elif not self.use_gemini_caption.isChecked():
+            self.log("[debug/gemini-motion] Gemini disattivato -> fallback locale")
+        else:
+            self.log("[debug/gemini-motion] API key presente -> fallback locale (motion-plan remoto non attivo)")
+
+    @staticmethod
+    def _extract_json_candidate(text: str) -> str:
+        import re
+
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        fence = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", raw, flags=re.IGNORECASE)
+        if fence:
+            return fence.group(1).strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return raw[start : end + 1].strip()
+        return raw
+
+    def _request_gemini_motion_plan(
+        self,
+        key_idxs: List[int],
+    ) -> Tuple[Dict[int, Tuple[float, float]], Dict[int, Dict[str, Tuple[float, float]]]]:
+        if not self.use_gemini_caption.isChecked():
+            return {}, {}
+        api_key = normalize_gemini_api_key(self.gemini_api_key.text())
+        if not api_key:
+            return {}, {}
+
+        anchor_idx = key_idxs[0]
+        anchor = self.frames[anchor_idx]
+        if anchor.rig_nodes is None:
+            return {}, {}
+        bones = self.get_frame_bones(anchor)
+        correspondence = anchor.bone_correspondence or self.analyze_frame_bone_correspondence(anchor_idx, log_result=False)
+        node_names = sorted(anchor.rig_nodes.keys())
+        frame_size = self.get_frame_canvas_size(anchor_idx)
+        if frame_size is None:
+            return {}, {}
+        fw, fh = frame_size
+        if fw <= 0 or fh <= 0:
+            return {}, {}
+
+        anchor_norm = {
+            n: [round(anchor.rig_nodes[n][0] / fw, 4), round(anchor.rig_nodes[n][1] / fh, 4)] for n in node_names
+        }
+        key_desc = []
+        for k in key_idxs:
+            fr = self.frames[k]
+            key_desc.append(
+                {
+                    "frame": k,
+                    "description": (fr.key_description or fr.caption or "").strip(),
+                }
+            )
+
+        prompt = {
+            "task": "Generate coherent skeletal motion plan for 2D sprite animation.",
+            "language": "it",
+            "user_animation_prompt": (self.prompt.toPlainText() or "").strip(),
+            "frames_count": len(self.frames),
+            "rig_profile": self.resolve_rig_profile(anchor),
+            "nodes": node_names,
+            "bones": bones,
+            "bone_to_anatomy_map": [{"bone": [a, b], "anatomy": correspondence.get((a, b), f"{a}->{b}")} for (a, b) in bones],
+            "anchor_frame_index": anchor_idx,
+            "anchor_nodes_normalized_xy": anchor_norm,
+            "keyframes_hint": key_desc,
+            "constraints": [
+                "Return ONLY JSON object, no markdown.",
+                "Use normalized offsets relative to width/height.",
+                "Keep offsets in range [-0.25, 0.25].",
+                "Prefer smooth periodic motion with temporal coherence.",
+                "Keep torso/head relatively stable and move distal limbs more.",
+            ],
+            "output_schema": {
+                "frames": [
+                    {
+                        "index": 0,
+                        "global_offset": [0.0, 0.0],
+                        "node_offsets": {"node_name": [0.0, 0.0]},
+                    }
+                ]
+            },
+        }
+
+        model = self.gemini_model.text().strip() or "gemini-2.5-flash"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": json.dumps(prompt, ensure_ascii=True)}]}],
+            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+        }
+        try:
+            res = requests.post(
+                url,
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                params={"key": api_key},
+                json=body,
+                timeout=60,
+            )
+            if not res.ok:
+                self.log(f"[debug/gemini-motion] {format_gemini_http_error(res)} -> fallback locale")
+                return {}, {}
+            payload = res.json()
+            parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            text = "\n".join([p.get("text", "") for p in parts if p.get("text")]).strip()
+            if not text:
+                self.log("[debug/gemini-motion] Gemini risposta vuota: fallback locale")
+                return {}, {}
+            candidate = self._extract_json_candidate(text)
+            data = json.loads(candidate)
+        except Exception as e:
+            self.log(f"[debug/gemini-motion] parsing/chiamata Gemini fallita: {e}")
+            return {}, {}
+
+        frames = data.get("frames", []) if isinstance(data, dict) else []
+        if not isinstance(frames, list):
+            self.log("[debug/gemini-motion] schema non valido (frames assente): fallback locale")
+            return {}, {}
+
+        global_offsets: Dict[int, Tuple[float, float]] = {}
+        node_offsets: Dict[int, Dict[str, Tuple[float, float]]] = {}
+        valid_entries = 0
+        for item in frames:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(self.frames):
+                continue
+            g = item.get("global_offset", [0.0, 0.0])
+            if isinstance(g, list) and len(g) == 2:
+                try:
+                    gx = max(-0.25, min(0.25, float(g[0])))
+                    gy = max(-0.25, min(0.25, float(g[1])))
+                    global_offsets[idx] = (gx, gy)
+                except Exception:
+                    pass
+
+            nmap: Dict[str, Tuple[float, float]] = {}
+            no = item.get("node_offsets", {})
+            if isinstance(no, dict):
+                for n, vec in no.items():
+                    if n not in node_names or not isinstance(vec, list) or len(vec) != 2:
+                        continue
+                    try:
+                        ox = max(-0.25, min(0.25, float(vec[0])))
+                        oy = max(-0.25, min(0.25, float(vec[1])))
+                        nmap[n] = (ox, oy)
+                    except Exception:
+                        continue
+            node_offsets[idx] = nmap
+            valid_entries += 1
+
+        if valid_entries == 0:
+            self.log("[debug/gemini-motion] nessun frame valido nel motion-plan: fallback locale")
+            return {}, {}
+        self.log(f"[debug/gemini-motion] motion-plan Gemini ok: frames_validi={valid_entries} node_set={len(node_names)}")
+        return global_offsets, node_offsets
+
+    @staticmethod
+    def _clip_nodes_to_canvas(nodes: Dict[str, Tuple[float, float]], size: Tuple[int, int]) -> Dict[str, Tuple[float, float]]:
+        w, h = size
+        out = {}
+        for n, (x, y) in nodes.items():
+            out[n] = (
+                max(0.0, min(float(w - 1), float(x))),
+                max(0.0, min(float(h - 1), float(y))),
+            )
+        return out
+
     def simulate_rig_animation(self):
-        key_idxs = [i for i, fr in enumerate(self.frames) if fr.is_keyframe and fr.rig_nodes is not None]
+        explicit_keys = [i for i, fr in enumerate(self.frames) if fr.is_keyframe and fr.rig_nodes is not None]
+        key_idxs = list(explicit_keys)
         if not key_idxs:
             key_idxs = [i for i, fr in enumerate(self.frames) if fr.rig_nodes is not None]
         if not key_idxs:
             QMessageBox.warning(self, "Attenzione", "Carica almeno un frame chiave")
             return
 
+        for k in key_idxs:
+            self.analyze_frame_bone_correspondence(k, log_result=True)
+        self._log_gemini_motion_debug(key_idxs, explicit_keys)
+        gemini_global_offsets, gemini_node_offsets = self._request_gemini_motion_plan(key_idxs)
         amp, bob, swing = self._motion_params_from_prompt()
         for i in range(len(self.frames)):
             fr = self.frames[i]
@@ -2428,6 +3192,22 @@ class MainWindow(QMainWindow):
                             nodes[n] = (x + dx * 0.35, y + dy * 0.35)
                 fr.rig_nodes = nodes
                 fr.detected_profile = src.detected_profile
+            if fr.rig_nodes is not None and (i in gemini_global_offsets or i in gemini_node_offsets):
+                frame_size = self.get_frame_canvas_size(i)
+                if frame_size is not None:
+                    gw = float(frame_size[0])
+                    gh = float(frame_size[1])
+                    gx, gy = gemini_global_offsets.get(i, (0.0, 0.0))
+                    global_px = (gx * gw * 0.55, gy * gh * 0.55)
+                    per_node = gemini_node_offsets.get(i, {})
+                    adjusted = {}
+                    for n, (x, y) in fr.rig_nodes.items():
+                        ox, oy = per_node.get(n, (0.0, 0.0))
+                        adjusted[n] = (
+                            x + global_px[0] + ox * gw * 0.85,
+                            y + global_px[1] + oy * gh * 0.85,
+                        )
+                    fr.rig_nodes = self._clip_nodes_to_canvas(adjusted, frame_size)
             bones = self.get_frame_bones(fr)
             fr.bone_lengths = compute_bone_lengths(fr.rig_nodes, bones)
         self.mark_rig_dirty()
@@ -2508,35 +3288,163 @@ class MainWindow(QMainWindow):
                 return
 
         use_cuda = torch.cuda.is_available()
+        model_choice = (self.sdxl_base_model_path.text() or "").strip()
+        base_model_id = model_choice if model_choice else SDXL_BASE_MODEL_ID
+        base_model_path = Path(base_model_id)
+        if base_model_id.lower().endswith((".safetensors", ".ckpt")) and not base_model_path.exists():
+            QMessageBox.warning(self, "Modello SDXL", f"File checkpoint non trovato:\n{base_model_id}")
+            return
         try:
-            pipe = load_pipe("runwayml/stable-diffusion-v1-5", "lllyasviel/control_v11p_sd15_openpose", use_cuda)
+            pipe = load_pipe(base_model_id, SDXL_CONTROLNET_OPENPOSE_ID, use_cuda)
+            pipe_i2i = load_pipe_img2img(base_model_id, SDXL_CONTROLNET_OPENPOSE_ID, use_cuda)
+            self.log(f"[raster] Backend diffusion: SDXL ({base_model_id}) + ControlNet ({SDXL_CONTROLNET_OPENPOSE_ID})")
         except Exception as e:
             QMessageBox.critical(self, "Errore", f"Caricamento modelli fallito: {e}")
             return
 
-        base_img = self.frames[idx0].image.convert("RGB")
+        base_rgba = self.frames[idx0].image.convert("RGBA")
+        base_img = base_rgba.convert("RGB")
+        base_nodes_ref = self.frames[idx0].rig_nodes or {}
         plan = calc_gen_size(base_img.width, base_img.height, "resize_down")
+        prompt_txt = self.prompt.toPlainText().strip()
+        if not prompt_txt:
+            prompt_txt = (self.frames[idx0].caption or "").strip()
+        if not prompt_txt:
+            prompt_txt = "pixel art game sprite, clean silhouette, consistent character design"
+        neg_txt = self.negative.toPlainText().strip()
+        if not neg_txt:
+            neg_txt = "blurry, noisy, glitch, abstract, deformed, bad anatomy, text, watermark, low quality"
+        strength_val = max(0.1, min(0.95, float(self.gen_strength.value())))
+        control_val = max(0.2, min(2.5, float(self.control_weight.value())))
+        use_rig_warp_mode = bool(self.force_rig_warp.isChecked()) or max(base_rgba.size) <= 192
+        if use_rig_warp_mode:
+            self.log("[raster] Modalita rig-warp attiva (sprite piccolo): bypass diffusion")
 
         generator = torch.Generator(device="cuda" if use_cuda else "cpu").manual_seed(42)
+        prev_raster: Optional[Image.Image] = None
+        prev_raster_work: Optional[Image.Image] = None
+        prev_nodes: Optional[Dict[str, Tuple[float, float]]] = None
 
         for i, fr in enumerate(self.frames):
             try:
+                if fr.image is not None:
+                    # Keep explicitly provided raster frames untouched.
+                    src_rgba = compose_with_offset(fr.image, fr.image_offset).convert("RGBA")
+                    fr.generated = src_rgba
+                    prev_raster = fr.generated
+                    prev_raster_work = src_rgba
+                    prev_nodes = dict(fr.rig_nodes) if fr.rig_nodes is not None else None
+                    self.log(f"Frame {i + 1}: raster caricato, salto rigenerazione")
+                    continue
+
+                corr_map = fr.bone_correspondence or self.analyze_frame_bone_correspondence(i, log_result=False)
+                anatomy_terms = sorted(set(corr_map.values())) if corr_map else []
+                anatomy_hint = ", ".join(anatomy_terms[:10])
+                prompt_frame = prompt_txt if not anatomy_hint else f"{prompt_txt}. Skeleton anatomy map: {anatomy_hint}."
+                self.log(
+                    f"[raster] frame {i + 1}: bone-map {'presente' if corr_map else 'assente'}"
+                    + (f" ({len(corr_map)} segmenti)" if corr_map else "")
+                )
+
+                if use_rig_warp_mode and fr.rig_nodes is not None and base_nodes_ref:
+                    warp_src = base_rgba
+                    warp_nodes = base_nodes_ref
+                    mode = "rig_warp_base"
+                    if prev_raster_work is not None and prev_nodes is not None:
+                        warp_src = prev_raster_work
+                        warp_nodes = prev_nodes
+                        mode = "rig_warp_chain"
+                    # Keep an unfiltered working raster for the next step to avoid cumulative erosion.
+                    out_work = warp_sprite_with_rig(warp_src, warp_nodes, fr.rig_nodes)
+                    out_rgba = quantize_to_reference_palette(out_work, base_rgba, max_colors=48)
+                    tol = int(self.eyedropper_tol.value())
+                    key_rgb = pick_effective_key_color(out_rgba, self.last_eyedrop_color, tol)
+                    out_rgba = apply_chroma_key(out_rgba, key_rgb, tol, edge_connected=True)
+                    fr.generated = out_rgba
+                    prev_raster = out_rgba
+                    prev_raster_work = out_work
+                    prev_nodes = dict(fr.rig_nodes)
+                    self.log(f"Generato frame {i + 1}/{len(self.frames)} mode={mode}")
+                    continue
+
                 bones = self.get_frame_bones(fr)
-                pose_map = rig_to_pose_map(fr.rig_nodes, fr.image.size if fr.image is not None else base_img.size, bones)
+                frame_size = self.get_frame_canvas_size(i) or base_img.size
+                pose_map = rig_to_pose_map(fr.rig_nodes, frame_size, bones)
                 pose_in = resize_or_pad(pose_map.convert("RGB"), plan)
-                out = pipe(
-                    prompt=self.prompt.toPlainText().strip() or "sprite",
-                    negative_prompt=self.negative.toPlainText().strip(),
-                    image=pose_in,
-                    num_inference_steps=20,
-                    guidance_scale=7.5,
-                    generator=generator,
-                    width=plan.gen_w,
-                    height=plan.gen_h,
-                ).images[0]
+                motion_score = 0.0
+                strength_eff = strength_val
+                control_eff = control_val
+                guidance_eff = 5.6
+                use_i2i = prev_raster is not None
+                mode = "img2img_chain"
+                if prev_raster is not None:
+                    init_src = prev_raster.convert("RGBA")
+                    if prev_nodes is not None and fr.rig_nodes is not None:
+                        dx, dy = estimate_global_rig_shift(prev_nodes, fr.rig_nodes)
+                        dx = int(round(dx * 1.60))
+                        dy = int(round(dy * 1.60))
+                        init_src = shift_image_on_canvas(init_src, dx, dy)
+                        motion_score = rig_motion_score(prev_nodes, fr.rig_nodes, frame_size)
+                        strength_eff = max(0.20, min(0.98, strength_val + motion_score * 0.55))
+                        control_eff = max(0.6, min(2.5, control_val + motion_score * 1.00))
+                        guidance_eff = max(4.8, min(6.2, 5.8 - motion_score * 0.8))
+                        # Keep chain behavior: always use previous frame as reference.
+                        use_i2i = True
+                    if use_i2i:
+                        init_prev = resize_or_pad(init_src.convert("RGB"), plan)
+                        init_img = init_prev
+                        mode = "img2img_chain"
+                        out = pipe_i2i(
+                            prompt=prompt_frame,
+                            negative_prompt=neg_txt,
+                            image=init_img,
+                            control_image=pose_in,
+                            strength=strength_eff,
+                            num_inference_steps=28,
+                            guidance_scale=guidance_eff,
+                            controlnet_conditioning_scale=control_eff,
+                            generator=generator,
+                        ).images[0]
+                    else:
+                        mode = "txt2img_pose_lock"
+                        out = pipe(
+                            prompt=prompt_frame,
+                            negative_prompt=neg_txt,
+                            image=pose_in,
+                            num_inference_steps=34,
+                            guidance_scale=max(5.8, guidance_eff),
+                            controlnet_conditioning_scale=max(control_eff, control_val + 0.5),
+                            generator=generator,
+                            width=plan.gen_w,
+                            height=plan.gen_h,
+                        ).images[0]
+                else:
+                    mode = "txt2img_init"
+                    out = pipe(
+                        prompt=prompt_frame,
+                        negative_prompt=neg_txt,
+                        image=pose_in,
+                        num_inference_steps=32,
+                        guidance_scale=6.0,
+                        controlnet_conditioning_scale=control_eff,
+                        generator=generator,
+                        width=plan.gen_w,
+                        height=plan.gen_h,
+                    ).images[0]
                 out = crop_or_resize_back(out, plan)
-                fr.generated = out.convert("RGBA")
-                self.log(f"Generato frame {i + 1}/{len(self.frames)}")
+                out_rgba = out.convert("RGBA")
+                # Keep generated frames in the same color family as the source sprite.
+                out_rgba = quantize_to_reference_palette(out_rgba, base_rgba, max_colors=48)
+                # Apply chroma key chosen with eyedropper instead of forcing an external alpha mask.
+                tol = int(self.eyedropper_tol.value())
+                key_rgb = pick_effective_key_color(out_rgba, self.last_eyedrop_color, tol)
+                out_rgba = apply_chroma_key(out_rgba, key_rgb, tol, edge_connected=True)
+                fr.generated = out_rgba
+                prev_raster = out_rgba
+                prev_nodes = dict(fr.rig_nodes) if fr.rig_nodes is not None else None
+                self.log(
+                    f"Generato frame {i + 1}/{len(self.frames)} mode={mode} (motion={motion_score:.2f}, strength={strength_eff:.2f}, control={control_eff:.2f})"
+                )
             except Exception as e:
                 QMessageBox.critical(self, "Errore", f"Generazione frame {i + 1} fallita: {e}")
                 return
